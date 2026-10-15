@@ -29,7 +29,7 @@ BOTH = (MAIN, MIRROR)
 REFS = tuple(p.parent / "references" / "checks.md" for p in BOTH)
 ALL_DOCS = BOTH + REFS
 CHECK_ID_RE = re.compile(r"\b(?:XREF|ENG|PROC|ANON|META|TEXT|PAGE|TPL|ENDM|SUPP|NUM|CONFIG|CITE|FORM|ALLOW|LOG|BUILD|"
-                         r"APPX|FRAME|LENS|FIX)-[A-Z0-9]+(?:-[A-Z0-9]+)*\b")
+                         r"APPX|FRAME|LENS|FIX|VENUE)-[A-Z0-9]+(?:-[A-Z0-9]+)*\b")
 
 
 def read(path: Path) -> str:
@@ -228,7 +228,8 @@ def _command_segments(body: str):
 
 
 def test_scanner_flags_used_in_the_skills_exist():
-    cmds = ("scan", "finalize", "status", "repack", "edits", "apply", "restore")
+    cmds = ("scan", "finalize", "status", "repack", "edits", "apply", "restore", "venue-resolve", "venue-ingest",
+            "venue-check")
     opts = {cmd: scanner_options(cmd) for cmd in cmds}
     for path in BOTH:
         text = read(path)
@@ -238,7 +239,8 @@ def test_scanner_flags_used_in_the_skills_exist():
                 seen.add(cmd)
                 flags = set(re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", seg.split("#", 1)[0] if "#" in seg else seg))
                 assert flags <= opts[cmd], (path.name, cmd, sorted(flags - opts[cmd]))
-        assert {"scan", "finalize", "status", "apply", "restore"} <= seen, (path.name, sorted(seen))
+        assert {"scan", "finalize", "status", "apply", "restore", "venue-resolve", "venue-ingest",
+                "venue-check"} <= seen, (path.name, sorted(seen))
         flag_table = section(text, "### Step 1: Collect Inputs")
         documented = set(re.findall(r"`(--[a-z][a-z-]*)", flag_table))
         assert documented <= opts["scan"], (path.name, sorted(documented - opts["scan"]))
@@ -345,7 +347,7 @@ def test_the_fix_log_row_format_in_the_skill_parses():
 NEVER_QUEUED = ("PROC-TIME", "PROC-REVISION", "PROC-REVIEW", "PROC-DATESEED", "PROC-REGLABEL", "PROC-PENDING",
                 "ENG-FW", "ENG-HASH", "ENG-FILENAME", "ENG-PRECISION", "ENG-DENY", "ANON-CODENAME", "SUPP-NAME",
                 "SUPP-PROCFILE", "SUPP-PATH", "SUPP-RUNTIME", "TEXT-NOSPACE", "TEXT-GLUE", "TEXT-MATHGLYPH",
-                "TEXT-T3FONT", "META-FIGURE", "PAGE-FILL")
+                "TEXT-T3FONT", "META-FIGURE", "PAGE-FILL", "VENUE-STYLE", "VENUE-OPTION", "VENUE-PDF-SIZE")
 
 
 def test_the_plan_rules_name_every_check_the_loop_never_fixes():
@@ -444,6 +446,38 @@ def test_step_0_tries_the_skill_folder_first_in_both_trees():
             < main.index('".aris/tools/paper_hygiene_scan.py"'))
     assert (mirror.index('"$ARIS_REPO/skills/paper-hygiene-audit/scripts/paper_hygiene_scan.py"')
             < mirror.index('"$ARIS_REPO/tools/paper_hygiene_scan.py"'))
+
+
+
+def test_the_venue_options_are_the_paper_writing_ones():
+    pw = read(REPO_ROOT / "skills" / "paper-writing" / "SKILL.md")
+    m = re.search(r"^- \*\*VENUE = `([A-Za-z_]+)`\*\* — Target venue\. Options: (.+?)\. Affects", pw, re.M)
+    assert m, "the /paper-writing VENUE line moved"
+    options = tuple(re.findall(r"`([A-Za-z_]+)`", m.group(2)))
+    assert options == t.VENUE_FAMILIES and m.group(1) == t.VENUE_DEFAULT
+    for path in BOTH:
+        text = read(path)
+        hint = frontmatter(text)["argument-hint"]
+        const = next(ln for ln in text.splitlines() if ln.startswith("- **VENUE = "))
+        for v in options:
+            assert v in hint and "`%s`" % v in const, (path.name, v)
+        assert ("`%s`" % t.VENUE_DEFAULT) in const.split("—", 1)[0]
+
+
+def test_step_0_5_builds_the_venue_profile_from_official_pages_in_both_trees():
+    for path in BOTH:
+        step = section(read(path), "### Step 0.5: Resolve the Venue Profile")
+        for needle in ("venue-resolve", "venue-ingest", "venue-check", "--venue-profile", "official_hosts",
+                       "requirements.draft.json", "verbatim", "never from memory", "venue_profile_missing",
+                       "url_effective", "--proto '=https'", "year_unknown"):
+            assert needle in step, (path.name, needle)
+    assert "WebSearch" in frontmatter(read(MAIN))["allowed-tools"]
+    for ref in REFS:
+        venue = section(read(ref), "## Venue profiles")
+        for word in t.VENUE_FIELDS + t.VENUE_SECTION_POSITIONS + t.VENUE_REVIEW_MODELS:
+            assert word in venue, (ref, word)
+        draft = json.loads(next(b for lang, b in fenced_blocks(venue) if lang == "json"))
+        assert set(draft["fields"]) <= set(t.VENUE_FIELDS)
 
 
 if __name__ == "__main__":

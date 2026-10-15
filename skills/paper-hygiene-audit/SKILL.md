@@ -1,8 +1,8 @@
 ---
 name: paper-hygiene-audit
 description: "Detects and re-checks leaks in the PDF and supplement you upload: ?? or [?], engineering detail (versions, GPUs, hosts, paths), process narration, anonymity and metadata. A script decides; a fresh cross-model reviewer rules on ambiguous hits; `— recheck` re-audits read-only; `— fix` only makes checked deletions and writes a fix plan. Use when user says \"工程性描述\", \"检查问号\", \"终稿检查\", \"终稿复检\", \"投稿前检查\", \"查工程细节\", \"submission hygiene\", \"paper hygiene\", \"check for ??\"."
-argument-hint: "[paper-dir | pdf] [— recheck | — fix] [— tier: a] [— camera-ready] [— supp: <zip>] [— page-limit: N]"
-allowed-tools: Bash(*), Read, Write, Edit, Grep, Glob, Skill, mcp__codex__codex
+argument-hint: "[paper-dir | pdf] [— venue: <ICLR|NeurIPS|ICML|CVPR|ACL|AAAI|ACM|IEEE_JOURNAL|IEEE_CONF> [year]] [— recheck | — fix] [— tier: a] [— camera-ready] [— supp: <zip>] [— page-limit: N]"
+allowed-tools: Bash(*), Read, Write, Edit, Grep, Glob, Skill, WebSearch, WebFetch, mcp__codex__codex
 ---
 
 # Paper Hygiene Audit: Detect, Re-check, Fix Conservatively
@@ -19,9 +19,10 @@ Audit target: **$ARGUMENTS**
 
 **What this skill is: a detector and a final re-checker.** It reads the exact bytes you will upload, finds what must never be there, and says where each item is, why it is a problem, and how to fix it. `— recheck` re-audits the final files read-only, and only a recheck can say "upload these". `— fix` is deliberately narrow: it applies only fixes a script can check — it deletes confirmed leak fragments (library versions, absolute paths, hosts and IPs, secrets, ops commands, reviewer-confirmed hardware strings), deletes a whole sentence or clause that is nothing but a confirmed leak (`delete-sentence`: tooling, a storage place, a clock time, run or review narration — never one with a number, a reference, a result, a qualifier, an ordering next to a registration word, or in end matter, a table, a caption, or an equation), deletes author markers, turns a literal `\n` into a space, points a broken reference at the one label the script verified, drops a dangling key from a multi-key `\cite`, empties metadata fields where the sources set them and adds content-free metadata lines, and leaves junk out of a staged copy of the supplement. The script drafts every edit (`edits --from-queue`: the whole leak with the marks it leaves; a place no clean deletion takes is left for a person, with the sentence as the deletion would leave it); the executor reviews the draft and `apply` checks it. Everything else — rewording, renaming, dates and batch names, process narration that shares its sentence with content, framework names, code names, the reviewer's own findings, statements, a single-key dangling citation — goes to the **fix plan** (`paper/FIX_PLAN.md`, and `details.fix_plan`) for a person or a later agent.
 
-Three things to read the results by:
+Four things to read the results by:
 - **The fix plan is a list of candidates, not a to-do list.** On real papers many of its items are reviewer false positives, the same place can carry conflicting suggestions, and a suggestion can still drop a fact the filter does not see. Decide each item; never apply the plan wholesale.
 - **`WARN` is not "ready to upload".** A leak the reviewer reports on its own is WARN at most, and so is one confirmed at a WARN level. Upload only bytes a `— recheck` marked `upload_ready: true`, and confirm with `status` (exit 0).
+- **The venue sets the format rules.** `— venue:` (`/paper-writing`'s values) makes the skill fetch the edition's official call for papers, author guide, and template, cache them, and keep only the requirements it can quote from them (Step 0.5): page limit, required sections such as a paper checklist, anonymity, file limits, and the current template. Without a profile those checks are coverage gaps, never PASS.
 - **The policy switches change what counts as a leak** (precision, registration labels, supplement hardware). The precision and registration defaults report less; set the switches for your venue before the run (see *Policy switches* below).
 
 ## Why This Exists
@@ -70,10 +71,12 @@ It never judges numbers, citation validity, proofs, claim scope, or merit — it
 - **SUPP_OUT = `<archive stem>_clean.zip`** next to the original — under `— fix`, the re-packed supplement built from `supp_stage/`; it is the archive every later scan, the recheck, `status`, and the upload use.
 - **RUN_MODE = `audit`** — `audit` (detect only) | `recheck` (`— recheck`, the read-only final pass) | `fix` (`— fix`, conservative). `— fix` and `— recheck` are mutually exclusive.
 - **TIER = `ab`** — Tier A + Tier B. `— tier: a` runs the deterministic scan only: no reviewer cost, but candidates stay unreviewed, so any candidate caps the verdict at `WARN`.
-- **ANONYMOUS = `true`** — double-blind checks on. `— camera-ready` turns the ANON family and the anonymity lens off.
+- **VENUE = `ICLR`** — `/paper-writing`'s VENUE values and default: `ICLR`, `NeurIPS`, `ICML`, `CVPR`, `ACL`, `AAAI`, `ACM`, `IEEE_JOURNAL`, `IEEE_CONF`, and the venues it lists under them; an optional year picks the edition (default: the latest published one). Without `— venue:`, the venue whose template the sources load. Step 0.5 turns it into a verified profile.
+- **VENUE_CACHE = `~/.aris/venue-cache/`** (`$ARIS_VENUE_CACHE`) — per edition (`<venue>-<year>/`): the official pages and template as fetched, their text, and the verified profile `requirements.json`; shared by every project and rebuilt when older than 30 days (`— refresh-venue` forces it).
+- **ANONYMOUS = `true`** — double-blind checks on. `— camera-ready` turns the ANON family and the anonymity lens off, and so does a venue whose pages say submissions are not anonymous (or IEEE, when they say nothing).
 - **LENSES** — `triage`, `engineering`, `anonymity` (anonymous mode), `statements` (when end-matter statements are found); the scanner lists the enabled ones in `review_input.json`.
-- **PAGE_LIMIT** = unset — `— page-limit: 9` blocks a body that ends after page 9.
-- **END_MATTER** = unset — required closing statements in order; slots split by `;`, language variants by `|`: `— end-matter: "Ethics statement|伦理声明;Reproducibility statement"`.
+- **PAGE_LIMIT** = the venue profile's `page_limit` (`page_limit_camera_ready` under `— camera-ready`), counted as the profile says (the main body, or every page when the references count) — `— page-limit: 9` overrides and blocks a body that ends after page 9.
+- **END_MATTER** = the venue profile's required sections (a statement before the references, a paper checklist after them) — `— end-matter:` overrides with required closing statements in order; slots split by `;`, language variants by `|`: `— end-matter: "Ethics statement|伦理声明;Reproducibility statement"`.
 - **HARDWARE = `block`** — level of an accelerator/CPU model or count that the reviewer confirms as a leak: `block`, `warn`, or `info`. In compute-resources, checklist, and related-work sections hardware is INFO, and the reviewer still sees it as a low-priority group.
 - **FRAMEWORK = `warn`** — level of a framework or tooling name the reviewer confirms as a leak; `— framework: block` when none may appear.
 - **SUPP_HARDWARE = HARDWARE** — hardware, OS, and host words in the supplement's notes and member names follow the hardware policy: candidates (WARN) whose confirmed level is HARDWARE; a reproduction requirement ("needs a GPU with 24 GB") is ruled `necessary`. `— supp-hardware: warn|block` (or policy `supp_hardware`) sets another confirmed level; `info` (or `— hardware: info`) keeps them INFO and unreviewed.
@@ -88,7 +91,7 @@ It never judges numbers, citation validity, proofs, claim scope, or merit — it
 - **OUTPUT = `PAPER_HYGIENE_AUDIT.md`** · **STATE = `PAPER_HYGIENE_AUDIT.json`** · **PLAN = `FIX_PLAN.md`** — fixed paths in PAPER_DIR, overwritten every run (remove them before a source upload).
 - **RENDER_HTML = false** — opt-in (`— render html: true`): this audit is meant to be re-run cheaply, so the extra review gate of `/render-html` is off by default.
 
-> Override inline: `/paper-hygiene-audit "paper/" — fix — page-limit: 9 — framework: block — supp: "supplementary.zip"`
+> Override inline: `/paper-hygiene-audit "paper/" — venue: NeurIPS — fix — framework: block — supp: "supplementary.zip"`
 
 ### Policy switches: which value when
 
@@ -138,6 +141,35 @@ If the block exits, write `paper/PAPER_HYGIENE_AUDIT.json` by hand with `verdict
 ⚡ [effort: balanced] fix_rounds=2 | Tier B: gpt-6-astra xhigh (fresh thread) | scanner: <resolved path>
 ```
 
+### Step 0.5: Resolve the Venue Profile (Executor — Claude)
+
+The venue decides the template, the page limit and what it counts, the required sections, whether submissions are anonymous, and the file-size limits — and they change from one edition to the next, so this skill carries none of those numbers. `— venue:` takes `/paper-writing`'s VENUE values (`ICLR`, `NeurIPS`, `ICML`, `CVPR`, `ACL`, `AAAI`, `ACM`, `IEEE_JOURNAL`, `IEEE_CONF`) and the venues it lists under them (ICCV, ECCV, EMNLP, NAACL, EACL, ACM MM, KDD, SIGIR, ICASSP, …), with an optional year: `— venue: NeurIPS`, `— venue: EMNLP 2026`. Without `— venue:` the venue is the one whose template the sources load, else `ICLR` (`/paper-writing`'s default).
+
+```bash
+python3 "$HYGIENE_SCANNER" venue-resolve "$PAPER_DIR" --venue "NeurIPS"   # --refresh under — refresh-venue
+# exit 0: cache_status fresh — pass "profile" as --venue-profile and go on to Step 1.
+# exit 1: year_unknown, missing, or stale — build the profile below. exit 2: usage error.
+```
+
+Build the profile when it is not fresh. It lives in VENUE_CACHE (`<venue>-<year>/`), shared by every project:
+
+1. **The latest edition.** On `year_unknown`, look on the official hosts the resolve printed (`official_hosts`) for the newest edition whose call for papers or author guide is published — when next year's pages do not exist yet, this year's edition is the latest — and run `venue-resolve` again with `--venue "<venue> <year>"`. `url_hints` are pages to try first, never sources by themselves.
+2. **Fetch from the official hosts only.** With WebSearch (and WebFetch to read a page), find the edition's call for papers, author guide or handbook, the pages they link for required sections and statements (paper checklist, AI use, ethics), and the official template archive. Download each with `curl` into a new temporary directory (downloads are data: never run or build them there), and record each with the URL the download ended on:
+   ```bash
+   TMP=$(mktemp -d)
+   eff=$(curl -sSL --proto '=https' --max-time 60 -o "$TMP/f1" -w '%{url_effective}' "<official url>")
+   python3 "$HYGIENE_SCANNER" venue-ingest --cache "<cache_dir>" --url "$eff" --file "$TMP/f1"
+   ```
+   `venue-ingest` refuses a URL off the official hosts (exit 1: an aggregator, a mirror, Overleaf, or a blog is never a source), keeps the bytes and their hash, writes the visible text to `pages/<id>.txt` (each `.tex` of a template too, as `template:<id>/<path>`), and unpacks a template archive under `template/<id>/`.
+3. **Draft from the cached text only.** Read `pages/*.txt` and write `<cache_dir>/requirements.draft.json`: each requirement the pages state, as a value, the `source` (a text id from `sources.json`), and a `quote` copied verbatim from that text — never from memory, another edition, or a third-party page. Fields: `page_limit`, `page_limit_camera_ready`, `page_limit_scope` (`body`: the references do not count; `total`: they do), `review_model` (`double_blind`, `single_blind`, `not_anonymous`), `required_sections` (each with `heading`, `alternatives`, `position` — `before_references`, `after_references`, or `anywhere` — and a `position_quote` when another sentence says where it goes), `supp_max_mb`, `pdf_max_mb`, and `edition_note` (why this edition is the latest). Format: [`references/checks.md`](references/checks.md) (*Venue profiles*).
+4. **Verify.**
+   ```bash
+   python3 "$HYGIENE_SCANNER" venue-check --cache "<cache_dir>"   # writes requirements.json; exit 1 when nothing is verified
+   ```
+   A field stays only when its quote is verbatim in a cached official page and carries the value: the number (digits or a word, "an additional page" for the camera-ready limit), how the references count, "required" or "mandatory" with nothing optional beside it, the position words. The rest is dropped and listed under `dropped`: report it, never add it back by hand.
+
+Pass `--venue "<venue> <year>" --venue-profile "<cache_dir>/requirements.json"` to every scan. The profile sets the page limit (`page_limit_camera_ready` under `— camera-ready`) and what it counts, the required sections and where they go, whether the anonymity checks run, the archive and PDF size limits, and the official template TPL-STYLE compares with; VENUE-STYLE and VENUE-OPTION hold the sources to that template and its switches. A flag or a `policy.json` value still wins. Without web access, or when no official page could be fetched, scan with `--venue` alone: what a profile would set is recorded as a `venue_profile_missing` coverage gap, so the verdict cannot be PASS — never filled in from memory.
+
 ### Step 1: Collect Inputs (Executor — Claude)
 
 Locate paths WITHOUT opening or interpreting the paper:
@@ -168,6 +200,9 @@ config       .aris/paper-hygiene/{anon-names.txt, allow.tsv, policy.json} — op
 | `— registration-labels: flag` | `--registration-labels flag` |
 | `— style-ref: <dir>` | `--style-ref <dir>` (byte-compare the official `.sty/.cls/.bst`) |
 | `— no-freshness` | `--no-freshness` (after a checkout reset file times) |
+| `— venue: <name> [year]` (Step 0.5) | `--venue "<name> <year>"` `--venue-profile <cache_dir>/requirements.json` |
+| `— venue-profile: <requirements.json>` (a profile built elsewhere, e.g. for an offline run) | `--venue-profile <file>` |
+| `— refresh-venue` | Step 0.5 rebuilds the profile (`venue-resolve` with refresh) |
 
 ### Step 2: Tier A — Deterministic Scan (helper, Type-A)
 
@@ -178,7 +213,7 @@ mkdir -p "$WORK"
 scan_rc=0
 python3 "$HYGIENE_SCANNER" scan "$PAPER_DIR" --run-mode audit --work-dir "$WORK" \
     --json-out "$WORK/scan.json" > /dev/null || scan_rc=$?
-# Append the Step 1 flags, e.g. --supp supplementary.zip --page-limit 9.
+# Append the Step 1 flags, e.g. --venue "NeurIPS 2026" --venue-profile "$PROFILE" --supp supplementary.zip.
 # Fix rounds after round 0 also pass --baseline "$WORK/scan_r0.json" --previous "$WORK/scan_r<N-1>.json";
 # a recheck after a fix run passes --baseline "$WORK/scan_r0.json".
 # exit 0 = PASS / WARN / NOT_APPLICABLE · 1 = FAIL · 2 = BLOCKED / ERROR / usage error.
@@ -519,7 +554,7 @@ python3 "$HYGIENE_SCANNER" edits --paper-dir "$PAPER_DIR" --before "$WORK/scan_r
 | `supp-remove` | SUPP-JUNK, SUPP-ARIS: junk, agent working files, run logs | the member leaves the staged copy (kept in `attic_r<N>/`) |
 | `repack` | SUPP-META, SUPP-GZIP, SUPP-TAR | the deterministic re-pack: zip times and comment, gzip headers, tar owners, times, and modes; a re-compressed xz member never comes out larger than a stronger preset allows (`apply --stage-only` makes the staged copy when no supplement edit does) |
 
-Everything else is in the fix plan, never in the queue — unless it is the whole of a sentence or clause `delete-sentence` takes: process, review, and revision narration, dates and batch names (PROC-TIME, PROC-REVISION, PROC-REVIEW, PROC-DATESEED, PROC-REGLABEL), unfinished work (PROC-PENDING), framework names (ENG-FW), engineering wording (ENG-OPS candidates), hashes (ENG-HASH), file names in the prose (ENG-FILENAME), precision (ENG-PRECISION), code names (ENG-DENY, ANON-CODENAME), every anonymity finding, statements and every reviewer finding (LENS-*), a single-key or probable-typo citation, a reference without a unique target, renames, process files, placeholder and dangling paths (SUPP-NAME, SUPP-PROCFILE, SUPP-PATH), data and code changes (SUPP-RUNTIME), text-layer spacing and figures (TEXT-NOSPACE, TEXT-GLUE, TEXT-MATHGLYPH, TEXT-T3FONT, META-FIGURE), page fill (PAGE-FILL), a contested (flipped) ruling, the recall candidates (`plan_only`), a place no clean deletion takes (the plan shows the sentence as the deletion would leave it), and any item whose automatic fix was refused or undone (one undone for a layout regression is tried once more).
+Everything else is in the fix plan, never in the queue — unless it is the whole of a sentence or clause `delete-sentence` takes: process, review, and revision narration, dates and batch names (PROC-TIME, PROC-REVISION, PROC-REVIEW, PROC-DATESEED, PROC-REGLABEL), unfinished work (PROC-PENDING), framework names (ENG-FW), engineering wording (ENG-OPS candidates), hashes (ENG-HASH), file names in the prose (ENG-FILENAME), precision (ENG-PRECISION), code names (ENG-DENY, ANON-CODENAME), every anonymity finding, statements and every reviewer finding (LENS-*), a single-key or probable-typo citation, a reference without a unique target, renames, process files, placeholder and dangling paths (SUPP-NAME, SUPP-PROCFILE, SUPP-PATH), data and code changes (SUPP-RUNTIME), text-layer spacing and figures (TEXT-NOSPACE, TEXT-GLUE, TEXT-MATHGLYPH, TEXT-T3FONT, META-FIGURE), page fill (PAGE-FILL), the venue's template, switches, and PDF size (VENUE-STYLE, VENUE-OPTION, VENUE-PDF-SIZE), a contested (flipped) ruling, the recall candidates (`plan_only`), a place no clean deletion takes (the plan shows the sentence as the deletion would leave it), and any item whose automatic fix was refused or undone (one undone for a layout regression is tried once more).
 
 **How the fix plan words a fix** (the plan's suggestions, the reviewer's rewrites, and a person's edits follow the same rules; the plan marks a suggestion that adds words and lists them):
 1. **Keep every ordering.** A date or batch name that says one event came before or after another (a registration after the pilot data, one round after another) becomes a relative expression — *after*, *before*, *subsequently*, *the first runs*, *the later runs* — never a plain deletion. A date that orders nothing (a bug fix, a re-run with no separate result) is deleted.
@@ -551,7 +586,8 @@ Read every number from `PAPER_HYGIENE_AUDIT.json`, never from memory:
   Anonymity (ANON):         ✅ 0
   PDF metadata (META):      ⚠️ 1
   Text layer (TEXT):        ✅ 0
-  Pages (PAGE):             ✅ body ends p.9 (fill 98%)
+  Pages (PAGE):             ✅ body ends p.9 (fill 98%; limit 9 from the NeurIPS 2026 profile)
+  Venue (VENUE):            ✅ neurips_2026 loaded · checklist after the references
   Supplement (SUPP):        ❌ 1 blocking
   Reviewer findings (LENS): ⚠️ 3 (engineering 2 — process narration included — anonymity 1)
   Fix-loop damage (FIX):    ✅ 0 (12 changed places since round 0 from 14 applied edits, all within the whitelist; no regression)
@@ -619,6 +655,7 @@ The check families (XREF, LOG, ENG, PROC, ANON, META, TEXT, PAGE, TPL, ENDM, SUP
 | NUM-DRIFT | `/paper-claim-audit` |
 | LOG-OVERFULL | `/auto-paper-improvement-loop` Step 8 (its per-location policy) |
 | PAGE-LIMIT | `/paper-compile` Step 6 (move material to the appendix) |
+| VENUE-STYLE, VENUE-OPTION, VENUE-PDF-SIZE | `/paper-write` (the venue's current template, from the profile's cached copy) and `/paper-compile` (rebuild); `/paper-writing` passes the same `— venue:` |
 | Everything in FIX_PLAN.md | a person, or a later agent that follows the plan's rules, decides item by item (a candidate list, not a to-do list), and is re-checked with `— recheck` |
 | Other audits STALE after a fix | re-run each audit in `details.stale_other_audits` |
 
@@ -819,4 +856,5 @@ Every invocation — and every fix round — uses a fresh `mcp__codex__codex` th
 - Text-layer spacing has no verified automatic fix: the loop never changes interword-space settings, and FIX-REGRESSION only catches what a fix made worse (stray math glyphs by count, glued words through pypdf, `??`, `(?)`, page fill and limit, page count). A stray glyph that was already there at round 0 is TEXT-MATHGLYPH, for a person. Where a regression comes from is located by the words around each edit; when no edit is found on the page, every paper edit of the round is a suspect — for a layout regression, half of the suspects are undone per rebuild, so an innocent edit can go back with the culprit and is tried again in the next round. A page count that grew is INFO while the body ends where it did and keeps its fill and limit.
 - Snapshots keep text sources and supplementary text members up to 4 MB each (128 MB in all); binary members and larger ones are listed as changes to check by hand. Whether a member is gone is judged by each archive's complete name list (its central directory, a tar read in full): a member past the scan budget is listed as not compared, never as left out; a member inside a nested archive the budget never opened cannot be told apart from a removal and is listed as not compared too. `rounds/` keeps one copy of each round's re-packed supplement, so WORK grows with large archives.
 - Identifiers in code and records are not read for hardware, OS, or host words (`latency_per_host`), Python imports are not resolved (a leftover file that cannot run is not detected), and SUPP-LANG detects CJK prose only. Type 3 fonts are reported (TEXT-T3FONT, INFO); a glyph they lose in extraction is not.
-- Template files are byte-compared only with `— style-ref:`.
+- Template files are byte-compared with the venue profile's cached official template, or with `— style-ref:`.
+- **Venue rules are only as complete as the venue's own pages.** The profile holds what the edition's official pages state in a sentence `venue-check` can verify; a rule given only in an image, a PDF without a text layer, or a form on the submission site is missing, and a field whose quote does not carry the value is dropped and listed, never guessed. Track rules (datasets, position papers, workshops) need the track's own pages. Template detection reads `\documentclass` and `\usepackage` names, so a renamed copy of a venue style is not recognized as the venue's template (an edited copy under the official name is caught by TPL-STYLE). The venue table names each venue's official hosts; a conference on its own domain (many ACM venues) needs that domain in `policy.json` `venue_hosts`. VENUE-OPTION checks only the switches the venue table knows (a review or submission option, a final option or command), and only those the cached template defines.

@@ -5272,5 +5272,249 @@ def test_a_draft_the_executor_drops_is_kept_for_a_person_and_never_drafted_again
     assert t._discarded_keys(str(work), "fix", 2, []) == {}   # a finalize of another round reads nothing
 
 
+# ─── VENUE ───────────────────────────────────────────────────────────────────
+
+VENUE_HTML = (
+    "<!doctype html><html><head><title>Toy handbook</title><style>.x{color:red}</style>"
+    "<script>var hidden = 'Papers are limited to ninety pages';</script></head><body>"
+    "<h1>NeurIPS 2099 toy handbook</h1>"
+    "<p>The main text of a toy submission is limited to nine content pages, figures and tables included. "
+    "Additional pages holding references, appendices and the mandatory paper checklist do not count as content "
+    "pages. An accepted toy paper gets an additional content page for the camera-ready version. "
+    "The maximum file size is 50MB.</p>"
+    "<p>All toy submissions must be anonymized under the double-blind reviewing policy.</p>"
+    "<p>Authors are required to complete the paper checklist included in the toy template.</p>"
+    "<p>You are not required to include a section titled \"broader impacts\".</p>"
+    "<p>Code may be submitted separately in a single ZIP file of up to 100MB.</p></body></html>")
+VENUE_STY = "% toy style\n\\DeclareOption{final}{\\toyfinaltrue}\n\\ProcessOptions\\relax\n"
+VENUE_TPL_TEX = "\\documentclass{article}\n\\usepackage{neurips_2099}\n% The checklist should follow the references.\n"
+
+
+def _vargs(*argv):
+    return t.build_parser().parse_args([str(a) for a in argv])
+
+
+def _venue_cache(tmp_path, sty=VENUE_STY, fields=None):
+    """A NeurIPS 2099 cache built the way Step 0.5 builds one: resolve, ingest an
+    official page and the template archive, draft, check."""
+    root = tmp_path / "vcache"
+    doc, rc = t.run_venue_resolve(_vargs("venue-resolve", "--venue", "NeurIPS 2099", "--cache-root", root,
+                                         "--config-dir", tmp_path / "nocfg"))
+    assert rc == 1 and doc["cache_status"] == "missing"
+    cache = doc["cache_dir"]
+    page = tmp_path / "dl" / "page.html"
+    _write(tmp_path, "dl/page.html", VENUE_HTML)
+    page_doc, rc = t.run_venue_ingest(_vargs("venue-ingest", "--cache", cache, "--url",
+                                             "https://neurips.cc/Conferences/2099/MainTrackHandbook", "--file", page))
+    assert rc == 0 and page_doc["kind"] == "html"
+    kit = _zip(tmp_path / "dl" / "kit.zip", {"kit/neurips_2099.sty": sty.encode(), "kit/neurips_2099.tex":
+                                             VENUE_TPL_TEX.encode(), "kit/checklist.tex":
+                                             b"\\section*{NeurIPS Paper Checklist}\n"})
+    kit_doc, rc = t.run_venue_ingest(_vargs("venue-ingest", "--cache", cache, "--url",
+                                            "https://media.neurips.cc/Conferences/NeurIPS2099/Styles.zip", "--file", kit))
+    assert rc == 0 and kit_doc["kind"] == "zip"
+    pid, tid = page_doc["id"], "template:%s/kit/neurips_2099.tex" % kit_doc["id"]
+    draft = {"edition_note": "toy edition", "fields": fields if fields is not None else {
+        "page_limit": {"value": 9, "source": pid,
+                       "quote": "The main text of a toy submission is limited to nine content pages"},
+        "page_limit_camera_ready": {"value": 10, "source": pid, "quote": "An accepted toy paper gets an additional "
+                                                                         "content page for the camera-ready version."},
+        "page_limit_scope": {"value": "body", "source": pid,
+                             "quote": "Additional pages holding references, appendices and the mandatory paper "
+                                      "checklist do not count as content pages."},
+        "review_model": {"value": "double_blind", "source": pid,
+                         "quote": "All toy submissions must be anonymized under the double-blind reviewing policy."},
+        "required_sections": {"value": [
+            {"heading": "NeurIPS Paper Checklist", "alternatives": ["Paper Checklist"], "position": "after_references",
+             "source": pid, "quote": "Authors are required to complete the paper checklist included in the toy template.",
+             "position_source": tid, "position_quote": "The checklist should follow the references."},
+            {"heading": "Broader Impacts", "position": "before_references", "source": pid,
+             "quote": "You are not required to include a section titled \"broader impacts\"."}]},
+        "supp_max_mb": {"value": 100, "source": pid,
+                        "quote": "Code may be submitted separately in a single ZIP file of up to 100MB."},
+        "pdf_max_mb": {"value": 40, "source": pid, "quote": "The maximum file size is 50MB."},
+        "abstract_words": {"value": 250, "source": pid, "quote": "made up"}}}
+    _write(tmp_path, os.path.join(os.path.relpath(cache, str(tmp_path)), "requirements.draft.json"), json.dumps(draft))
+    prof, rc = t.run_venue_check(_vargs("venue-check", "--cache", cache))
+    return cache, prof, rc
+
+
+def test_the_venue_argument_takes_the_paper_writing_values_and_the_venues_they_list():
+    pv = t.parse_venue_arg
+    assert pv("NeurIPS") == {"family": "NeurIPS", "conference": "NeurIPS", "year": None}
+    assert pv("neurips2099")["year"] == 2099 and pv("nips 2099")["family"] == "NeurIPS"
+    assert pv("EMNLP 2099") == {"family": "ACL", "conference": "EMNLP", "year": 2099}
+    assert pv("IEEE_CONF ICASSP 2099") == {"family": "IEEE_CONF", "conference": "ICASSP", "year": 2099}
+    assert pv("ieee journal")["family"] == "IEEE_JOURNAL" and pv("ICCV")["family"] == "CVPR"
+    for bad in ("ToyConf 2099", "ICLR NeurIPS", "2099"):
+        with pytest.raises(t.UsageError):
+            pv(bad)
+
+
+def test_only_https_pages_on_the_venue_official_hosts_are_sources():
+    nips, iclr = t.venue_hosts("NeurIPS", "NeurIPS"), t.venue_hosts("ICLR", "ICLR")
+    ok = t.venue_url_ok
+    assert ok("https://neurips.cc/Conferences/2099/CallForPapers", nips)
+    assert ok("https://media.neurips.cc/Conferences/NeurIPS2099/Styles.zip", nips)
+    assert ok("https://github.com/ICLR/Master-Template/archive/main.zip", iclr)
+    for bad in ("http://neurips.cc/x", "https://neurips.cc.example.org/x", "https://toyneurips.cc/x",
+                "https://user:pw@neurips.cc/x", "https://www.overleaf.com/latex/templates/x",
+                "https://github.com/someone/ICLR/x"):
+        assert not ok(bad, nips + iclr), bad
+    assert ok("https://conf2099.example.org/cfp", t.venue_hosts("ACM", "KDD", ["conf2099.example.org"]))
+
+
+def test_the_template_the_sources_load_names_its_venue_edition_and_options(tmp_path):
+    _write(tmp_path, "p/main.tex", "\\documentclass[conference]{IEEEtran}\n% \\usepackage{iclr2099_conference}\n"
+                                   "\\usepackage[main,\n final]{neurips_2099}\n\\usepackage{aaai99,amsmath}\n")
+    got = t.detect_venue_styles(t.expand_tex(str(tmp_path / "p" / "main.tex"), str(tmp_path / "p")))
+    assert [(s["family"], s["name"], s["year"], s["options"], s["line"]) for s in got] == [
+        ("IEEE_CONF", "IEEEtran", None, ["conference"], 1),
+        ("NeurIPS", "neurips_2099", 2099, ["main", "final"], 3),
+        ("AAAI", "aaai99", 2099, [], 5)]
+    assert t.venue_of_style("IEEEtran", ["journal"]) == ("IEEE_JOURNAL", None)
+    assert t.venue_of_style("acl") == ("ACL", None) and t.venue_of_style("aclweb") == (None, None)
+
+
+def test_resolve_asks_for_the_latest_edition_then_reuses_a_fresh_cache(tmp_path):
+    root = tmp_path / "vcache"
+    _write(tmp_path, "p/main.tex", "\\documentclass{article}\n\\usepackage{neurips_2098}\n\\begin{document}\nx\n"
+                                   "\\end{document}\n")
+    base = ("--cache-root", root, "--config-dir", tmp_path / "nocfg")
+    doc, rc = t.run_venue_resolve(_vargs("venue-resolve", tmp_path / "p", *base))
+    assert (rc, doc["family"], doc["family_from"], doc["cache_status"], doc["sources_years"]) == (
+        1, "NeurIPS", "sources", "year_unknown", [2098])
+    doc, rc = t.run_venue_resolve(_vargs("venue-resolve", tmp_path / "p", "--venue", "NeurIPS 2099", *base))
+    assert (rc, doc["cache_status"], doc["url_hints"][0]) == (1, "missing",
+                                                              "https://neurips.cc/Conferences/2099/CallForPapers")
+    meta = json.loads((Path(doc["cache_dir"]) / "venue.json").read_text(encoding="utf-8"))
+    assert (meta["conference"], meta["year"], meta["hosts"]) == ("NeurIPS", 2099, ["neurips.cc"])
+    (Path(doc["cache_dir"]) / "requirements.json").write_text(json.dumps({"retrieved_at": t._now()}), encoding="utf-8")
+    doc, rc = t.run_venue_resolve(_vargs("venue-resolve", tmp_path / "p", *base))
+    assert (rc, doc["year"], doc["year_from"], doc["cache_status"]) == (0, 2099, "cache", "fresh")
+    doc, rc = t.run_venue_resolve(_vargs("venue-resolve", tmp_path / "p", "--venue", "NeurIPS 2099", "--refresh", *base))
+    assert (rc, doc["cache_status"]) == (1, "stale")
+    doc, rc = t.run_venue_resolve(_vargs("venue-resolve", tmp_path / "empty", *base))
+    assert (doc["family"], doc["family_from"]) == ("ICLR", "default")
+
+
+def test_ingest_refuses_other_hosts_reads_visible_text_and_unpacks_templates_safely(tmp_path):
+    doc, _ = t.run_venue_resolve(_vargs("venue-resolve", "--venue", "NeurIPS 2099", "--cache-root",
+                                        tmp_path / "vcache", "--config-dir", tmp_path / "nocfg"))
+    cache = doc["cache_dir"]
+    _write(tmp_path, "dl/page.html", VENUE_HTML)
+    off, rc = t.run_venue_ingest(_vargs("venue-ingest", "--cache", cache, "--url",
+                                        "https://www.overleaf.com/latex/templates/toy", "--file", tmp_path / "dl/page.html"))
+    assert rc == 1 and off["accepted"] is False and not (Path(cache) / "sources.json").exists()
+    got, rc = t.run_venue_ingest(_vargs("venue-ingest", "--cache", cache, "--url",
+                                        "https://neurips.cc/Conferences/2099/MainTrackHandbook", "--file",
+                                        tmp_path / "dl/page.html"))
+    text = (Path(cache) / got["texts"][0]["file"]).read_text(encoding="utf-8")
+    assert rc == 0 and "limited to nine content pages" in text and "ninety" not in text and "color:red" not in text
+    kit = _zip(tmp_path / "dl" / "kit.zip", {"kit/neurips_2099.sty": VENUE_STY.encode(), "../evil.sty": b"x",
+                                             "__MACOSX/kit/._neurips_2099.sty": b"x", "kit/notes.tex": b"% notes\n"})
+    got, rc = t.run_venue_ingest(_vargs("venue-ingest", "--cache", cache, "--url",
+                                        "https://media.neurips.cc/Conferences/NeurIPS2099/Styles.zip", "--file", kit))
+    assert rc == 0 and sorted(got["template_files"]) == ["kit/neurips_2099.sty", "kit/notes.tex"]
+    assert [x["id"] for x in got["texts"]] == ["template:%s/kit/notes.tex" % got["id"]]
+    assert not (tmp_path / "evil.sty").exists() and not list(Path(cache).rglob("evil.sty"))
+
+
+def test_check_keeps_only_requirements_a_verbatim_official_quote_carries(tmp_path):
+    cache, prof, rc = _venue_cache(tmp_path)
+    assert rc == 0 and prof["written"].endswith("requirements.json")
+    f = prof["fields"]
+    assert {k: v["value"] for k, v in f.items() if k != "required_sections"} == {
+        "page_limit": 9, "page_limit_camera_ready": 10, "page_limit_scope": "body", "review_model": "double_blind",
+        "supp_max_mb": 100.0}
+    assert [(s["heading"], s["position"]) for s in f["required_sections"]["value"]] == [
+        ("NeurIPS Paper Checklist", "after_references")]
+    dropped = {(d["field"], d.get("heading")): d["reason"] for d in prof["dropped"]}
+    assert "optional" in dropped[("required_sections", "Broader Impacts")]
+    assert "does not state 40" in dropped[("pdf_max_mb", None)] and dropped[("abstract_words", None)] == "unknown field"
+    assert (prof["template"]["files"], prof["template"]["edition_ok"], prof["template"]["family_ok"]) == (
+        ["neurips_2099.sty"], True, True)
+    # a quote that is not on the page, or a value the quote does not carry, never enters the profile
+    pid = json.loads((Path(cache) / "sources.json").read_text(encoding="utf-8"))[0]["id"]
+    _, prof2, _ = _venue_cache(tmp_path / "b", fields={
+        "page_limit": {"value": 8, "source": pid, "quote": "The main text of a toy submission is limited to nine "
+                                                           "content pages"},
+        "review_model": {"value": "double_blind", "source": pid, "quote": "Submissions are double-blind, always."}})
+    assert prof2["fields"] == {} and sorted(d["field"] for d in prof2["dropped"]) == ["page_limit", "review_model"]
+
+
+def _venue_paper(tmp_path, monkeypatch, style="\\usepackage{neurips_2099}", lines=(), sty=None):
+    _use_text(monkeypatch, ANON_P1 + ["A plain sentence."] + list(lines))
+    extra = {"neurips_2099.sty": sty} if sty is not None else None
+    return _paper(tmp_path, tex="\\documentclass{article}\n%s\n\\begin{document}\nA plain sentence.\n"
+                                "\\end{document}\n" % style, extra=extra)
+
+
+def test_a_scan_holds_the_paper_to_the_profile(tmp_path, monkeypatch):
+    cache, _, _ = _venue_cache(tmp_path)
+    prof = os.path.join(cache, "requirements.json")
+    paper = _venue_paper(tmp_path, monkeypatch, lines=["References", "Doe 2020.", "NeurIPS Paper Checklist", "1. Claims"],
+                         sty=VENUE_STY)
+    _, doc = _scan(tmp_path, paper, "--venue", "NeurIPS 2099", "--venue-profile", prof)
+    assert not [f for f in _live(doc) if f["family"] in ("VENUE", "ENDM", "TPL")]
+    ap = doc["venue"]["applied"]
+    assert (ap["page_limit"], ap["page_limit_from"], ap["page_limit_scope"], ap["after_references"], ap["supp_max_mb"],
+            ap["anonymous"]) == (9, "venue profile", "body", [["NeurIPS Paper Checklist", "Paper Checklist"]], 100.0, True)
+    assert doc["venue"]["templates_loaded"][0]["name"] == "neurips_2099"
+    # the checklist before the references, an edited style copy, a size over the policy limit
+    paper = _venue_paper(tmp_path / "b", monkeypatch, lines=["NeurIPS Paper Checklist", "1. Claims", "References",
+                                                             "Doe 2020."], sty="% edited\n")
+    _, doc = _scan(tmp_path / "b", paper, "--venue-profile", prof, cfg=_cfg(tmp_path / "b", policy={"pdf_max_mb": 1e-6}))
+    assert sorted((f["check"], f["severity"]) for f in _live(doc) if f["family"] in ("VENUE", "ENDM", "TPL")) == [
+        ("ENDM-ORDER", t.BLOCK), ("TPL-STYLE", t.BLOCK), ("VENUE-PDF-SIZE", t.BLOCK)]
+
+
+def test_another_venue_or_an_earlier_edition_template_blocks(tmp_path, monkeypatch):
+    cache, _, _ = _venue_cache(tmp_path)
+    prof = os.path.join(cache, "requirements.json")
+    for sub, style, expect in (("a", "\\usepackage{iclr2099_conference}", "ICLR template"),
+                               ("b", "\\usepackage{neurips_2098}", "loads the 2098 template"),
+                               ("c", "", "no \\documentclass or \\usepackage of the NeurIPS 2099 template")):
+        paper = _venue_paper(tmp_path / sub, monkeypatch, style=style, lines=["References", "NeurIPS Paper Checklist"])
+        rc, doc = _scan(tmp_path / sub, paper, "--venue-profile", prof)
+        got = [f for f in _live(doc) if f["check"] == "VENUE-STYLE"]
+        assert rc == 1 and len(got) == 1 and expect in got[0]["excerpt"], (sub, got)
+        assert "template_or_pages" in doc["reasons"]
+
+
+def test_switches_follow_the_mode_and_the_cached_template(tmp_path, monkeypatch):
+    cache, _, _ = _venue_cache(tmp_path)
+    prof = os.path.join(cache, "requirements.json")
+    lines = ["References", "NeurIPS Paper Checklist"]
+    paper = _venue_paper(tmp_path / "a", monkeypatch, lines=lines)
+    _, doc = _scan(tmp_path / "a", paper, "--venue-profile", prof, "--camera-ready")
+    got = [(f["check"], f["severity"], f["excerpt"]) for f in _live(doc) if f["check"] == "VENUE-OPTION"]
+    assert got == [("VENUE-OPTION", t.BLOCK, "the NeurIPS 2099 camera-ready copy needs neurips_2099 with [final]")]
+    assert doc["venue"]["applied"]["page_limit"] == 10  # the camera-ready limit
+    paper = _venue_paper(tmp_path / "b", monkeypatch, style="\\usepackage[final]{neurips_2099}", lines=lines)
+    _, doc = _scan(tmp_path / "b", paper, "--venue-profile", prof, "--camera-ready")
+    assert not [f for f in _live(doc) if f["check"] == "VENUE-OPTION"]
+    # a template that defines no such switch holds the paper to nothing
+    cache2, _, _ = _venue_cache(tmp_path / "c", sty="% no options\n")
+    paper = _venue_paper(tmp_path / "d", monkeypatch, lines=lines)
+    _, doc = _scan(tmp_path / "d", paper, "--venue-profile", os.path.join(cache2, "requirements.json"), "--camera-ready")
+    assert not [f for f in _live(doc) if f["check"] == "VENUE-OPTION"]
+
+
+def test_a_venue_without_a_profile_is_a_coverage_gap_and_ieee_counts_every_page(tmp_path, monkeypatch):
+    paper = _venue_paper(tmp_path, monkeypatch)
+    rc, doc = _scan(tmp_path, paper, "--venue", "NeurIPS")
+    gaps = {s["check"]: (s["reason"], s["cap"]) for s in doc["checks_skipped"]}
+    assert gaps["PAGE-LIMIT"] == gaps["ENDM-MISSING"] == gaps["TPL-STYLE"] == ("venue_profile_missing", "WARN")
+    assert doc["verdict_tier_a"] != "PASS" and not [f for f in _live(doc) if f["check"] == "VENUE-STYLE"]
+    paper = _venue_paper(tmp_path / "i", monkeypatch, style="")
+    _, doc = _scan(tmp_path / "i", paper, "--venue", "IEEE_CONF")
+    assert {s["reason"] for s in doc["checks_skipped"] if s["check"].startswith("ANON-")} == {"venue_not_anonymous"}
+    assert doc["venue"]["applied"]["page_limit_scope"] == "total"
+    f = t._page_findings({"status": "no_bbox"}, 6, None, 0.97, _ctx(), "main.pdf", [], "total", 7)
+    assert [(x["check"], x["severity"], x["match"]) for x in f] == [("PAGE-LIMIT", t.BLOCK, "7 pages")]
+    assert t._page_findings({"status": "no_bbox"}, 7, None, 0.97, _ctx(), "main.pdf", [], "total", 7) == []
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

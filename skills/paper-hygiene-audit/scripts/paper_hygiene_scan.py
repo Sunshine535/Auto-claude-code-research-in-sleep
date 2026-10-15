@@ -84,10 +84,12 @@ import sys
 import tarfile
 import tempfile
 import unicodedata
+import urllib.parse
 import zipfile
 import zlib
 from collections import Counter
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 
@@ -401,7 +403,8 @@ CHECKS: Dict[str, Dict[str, Any]] = {
                         "Typeset as math ($3.7\\times10^{-4}$, $-0.38$, '[1.25, 3.50]')."),
     # PAGE / TPL / ENDM
     "PAGE-LIMIT": _chk("PAGE", "pdf-geometry", "D", BLOCK, None, "P1",
-                       "The main body ends after the page limit.",
+                       "The main body ends after the page limit (--page-limit or the venue profile); where the venue "
+                       "counts every page (page_limit_scope total), the PDF has more pages than the limit.",
                        "Move existing content to the appendix or tighten wording; never shrink fonts or margins.",
                        route="/paper-compile"),
     "PAGE-FILL": _chk("PAGE", "pdf-geometry", "D", WARN, None, "P1",
@@ -414,11 +417,30 @@ CHECKS: Dict[str, Dict[str, Any]] = {
                       "A loaded .sty/.cls/.bst differs byte-for-byte from the official template (--style-ref).",
                       "Restore the official file."),
     "ENDM-MISSING": _chk("ENDM", "pdf", "D", BLOCK, None, "P1",
-                         "A required end-matter statement heading (--end-matter) is missing.",
+                         "A required end-matter statement or section heading (--end-matter, or a required "
+                         "section of the venue profile such as a paper checklist) is missing.",
                          "Add the statement with the exact heading the venue template uses."),
     "ENDM-ORDER": _chk("ENDM", "pdf", "D", BLOCK, None, "P1",
-                       "Required end-matter statements are out of order or after the references.",
-                       "Reorder them: after the main body, before the references, in the configured order."),
+                       "Required end-matter statements are out of order or after the references; a section the "
+                       "venue puts after the references comes before them.",
+                       "Reorder them: after the main body, before the references, in the configured order; a "
+                       "section the venue puts after the references (a paper checklist) goes after them."),
+    # VENUE — the target venue's template, switches, and file limits (— venue:)
+    "VENUE-STYLE": _chk("VENUE", "tex", "D", BLOCK, None, "P1",
+                        "The sources load another venue's template, no template of the target venue, or an earlier "
+                        "edition's style than the one the venue now provides (— venue:).",
+                        "Rebuild with the venue's current official template (the cached copy named in the venue "
+                        "profile); never edit or rename a style file.", route="/paper-compile"),
+    "VENUE-OPTION": _chk("VENUE", "tex", "D", "BLOCK/WARN", None, "P1",
+                         "The template's switches do not match the mode: an anonymous submission without the venue's "
+                         "review option, or a camera-ready copy that keeps it or lacks the final switch (BLOCK when "
+                         "the cached template defines the switch, WARN when no template is cached).",
+                         "Set the switch the venue's template documents for this mode and rebuild."),
+    "VENUE-PDF-SIZE": _chk("VENUE", "pdf-bytes", "D", BLOCK, None, "P1",
+                           "The PDF is larger than the venue's file-size limit (venue profile pdf_max_mb, or policy "
+                           "pdf_max_mb).",
+                           "Shrink embedded figures (vector or recompressed raster) and rebuild; never drop content.",
+                           route="/paper-compile"),
     # SUPP — supplementary archive
     "SUPP-INTEGRITY": _chk("SUPP", "supp", "D", BLOCK, None, "P1",
                            "The archive or a member is corrupt or truncated (CRC, zip/tar structure, gzip/xz stream).",
@@ -564,7 +586,7 @@ REASON_BY_FAMILY = {
     "XREF": "unresolved_refs", "ANON": "anonymity_leak", "ENG": "engineering_leak", "PROC": "process_narration",
     "META": "metadata_leak", "SUPP": "supplement_leak", "TEXT": "text_layer", "PAGE": "template_or_pages",
     "TPL": "template_or_pages", "NUM": "number_drift", "CONFIG": "config_changed", "ENDM": "end_matter",
-    "LOG": "build_errors",
+    "LOG": "build_errors", "VENUE": "template_or_pages",
 }
 # What a reader of the recheck must learn first: a leak still in the files,
 # then an unresolved reference, then metadata, then the rest (the fix loop's
@@ -642,7 +664,7 @@ META_PREAMBLE_LINES = (
 STOP_CHECKS = ("NUM-DRIFT", "CONFIG-CHANGED")
 # Never in the fix queue or the plan's to-do list: user configuration, coverage
 # gaps, stale builds, and findings whose policy lives in another skill.
-_NO_FIX_PREFIXES = ("SKIP-", "ALLOW-", "ANON-LIST-", "BUILD-STALE", "LOG-OVERFULL")
+_NO_FIX_PREFIXES = ("SKIP-", "ALLOW-", "ANON-LIST-", "BUILD-STALE", "LOG-OVERFULL", "VENUE-")
 # The FIX family (the loop's own damage) is undone first.
 UNDO_CHECKS = ("FIX-REGRESSION", "FIX-EDIT")
 
@@ -966,7 +988,7 @@ POLICY_KEYS = {
     "venue", "anonymous", "page_limit", "fill_page", "fill_threshold", "end_matter", "hardware", "framework",
     "supp_hardware", "strict", "supp_max_mb", "metadata_policy", "exempt_terms", "extra_deny", "region_headings",
     "body_end_markers", "declared_ai_uses", "notes", "precision_disclosure", "registration_labels",
-    "skeleton_result_words",
+    "skeleton_result_words", "venue_hosts", "pdf_max_mb",
 }
 # user policy switches with community-friendly defaults (the first value)
 PRECISION_POLICIES = ("exempt", "candidate")
@@ -3764,8 +3786,12 @@ def parse_end_matter(spec: Any) -> List[List[str]]:
 
 
 def check_end_matter(pages: List[Dict[str, Any]], slots: List[List[str]], ctx: ScanContext,
-                     artifact: str) -> List[Dict[str, Any]]:
-    if not slots:
+                     artifact: str, after: Sequence[Sequence[str]] = (),
+                     anywhere: Sequence[Sequence[str]] = ()) -> List[Dict[str, Any]]:
+    """`slots`: statements after the main body and before the references, in
+    order; `after`: sections the venue puts after the references (a paper
+    checklist); `anywhere`: sections that must only be present."""
+    if not slots and not after and not anywhere:
         return []
     heads: List[Tuple[int, int, str, str]] = []
     order = 0
@@ -3796,6 +3822,18 @@ def check_end_matter(pages: List[Dict[str, Any]], slots: List[List[str]], ctx: S
                 if o > refs_pos:
                     out.append(make_finding(ctx, "ENDM-ORDER", BLOCK, DEFINITE, "pdf", "%s after References" % name,
                                             "", {"artifact": artifact, "page": pg}))
+    for slot, must_follow in [(x, True) for x in after] + [(x, False) for x in anywhere]:
+        alts = [a.casefold() for a in slot]
+        hit = next(((o, pg) for o, pg, core, _ in heads if core in alts or any(core.startswith(a) for a in alts
+                                                                                if len(a) > 8)), None)
+        if hit is None:
+            if ctx.on("ENDM-MISSING"):
+                out.append(make_finding(ctx, "ENDM-MISSING", BLOCK, DEFINITE, "pdf", slot[0], " | ".join(slot),
+                                        {"artifact": artifact}, note="required by the venue profile"))
+            continue
+        if must_follow and refs_pos is not None and hit[0] < refs_pos and ctx.on("ENDM-ORDER"):
+            out.append(make_finding(ctx, "ENDM-ORDER", BLOCK, DEFINITE, "pdf", "%s before References" % slot[0],
+                                    "the venue puts it after the references", {"artifact": artifact, "page": hit[1]}))
     return out
 
 
@@ -6375,7 +6413,14 @@ def run_scan(a: Any) -> Dict[str, Any]:
     ctx = ScanContext()
     ctx.policy = pol
     run_mode = a.run_mode
+    venue = load_venue(a, pol)
+    vf: Dict[str, Any] = venue["fields"] if venue else {}
     camera = bool(a.camera_ready) or pol.get("anonymous") is False
+    anon_off = "camera_ready"
+    if venue and not camera and pol.get("anonymous") is None:
+        rm = vf.get("review_model")
+        if rm in ("single_blind", "not_anonymous") or (rm is None and not venue["spec"]["anonymous"]):
+            camera, anon_off = True, "venue_not_anonymous"
     ctx.anonymous = not camera
     ctx.strict = bool(a.strict) or bool(pol.get("strict"))
     for attr, flag, default in (("hardware", a.hardware, "block"), ("framework", a.framework, "warn")):
@@ -6407,10 +6452,26 @@ def run_scan(a: Any) -> Dict[str, Any]:
     ctx.run_mode = run_mode
     ctx.log_wrap = a.log_wrap  # type: ignore[attr-defined]
     page_limit = a.page_limit if a.page_limit is not None else pol.get("page_limit")
+    page_from = "flag or policy" if page_limit is not None else None
+    if page_limit is None and venue:
+        page_limit = vf.get("page_limit_camera_ready") if a.camera_ready else vf.get("page_limit")
+        page_from = "venue profile" if page_limit is not None else None
+    page_scope = (vf.get("page_limit_scope") or venue["spec"]["scope"]) if venue else "body"
     fill_page = a.fill_page if a.fill_page is not None else pol.get("fill_page")
     fill_thr = a.fill_threshold if a.fill_threshold is not None else float(pol.get("fill_threshold", 0.97))
     end_slots = parse_end_matter(a.end_matter if a.end_matter else pol.get("end_matter"))
+    after_slots: List[List[str]] = []
+    any_slots: List[List[str]] = []
+    if not end_slots and venue:  # the venue's required sections, in the order its pages give
+        for sec in vf.get("required_sections") or []:
+            alts = [sec["heading"]] + [x for x in sec.get("alternatives") or [] if x]
+            {"before_references": end_slots, "after_references": after_slots}.get(sec.get("position"),
+                                                                                  any_slots).append(alts)
     supp_max_mb = a.supp_max_mb if a.supp_max_mb is not None else pol.get("supp_max_mb")
+    if supp_max_mb is None and venue:
+        supp_max_mb = vf.get("supp_max_mb")
+    pdf_max_mb = pol.get("pdf_max_mb") if pol.get("pdf_max_mb") is not None else vf.get("pdf_max_mb")
+    style_ref = a.style_ref or ((venue or {}).get("style_dir"))
     # identity / deny / exempt
     auto_terms: List[str] = []
     if ctx.anonymous and not a.no_auto_identity:
@@ -6446,14 +6507,33 @@ def run_scan(a: Any) -> Dict[str, Any]:
             skipped.append({"check": cid, "reason": "user", "cap": None, "hint": None})
             continue
         if spec["family"] == "ANON" and not ctx.anonymous:
-            skipped.append({"check": cid, "reason": "camera_ready", "cap": None, "hint": None})
+            skipped.append({"check": cid, "reason": anon_off, "cap": None, "hint": None})
             continue
         enabled.add(cid)
+    if venue and not venue["profile"]:
+        # a venue with no profile: what its pages would set cannot be checked
+        hint = "build the venue profile (venue-resolve, venue-ingest, venue-check) and pass --venue-profile"
+        for cid, cond in (("PAGE-LIMIT", page_limit is None), ("ENDM-MISSING", not end_slots),
+                          ("ENDM-ORDER", not end_slots), ("TPL-STYLE", not style_ref),
+                          ("VENUE-PDF-SIZE", pdf_max_mb is None)):
+            if cond and cid in enabled:
+                skip(cid, "venue_profile_missing", "WARN", hint)
+    elif venue and page_limit is None and "PAGE-LIMIT" in enabled:
+        skip("PAGE-LIMIT", "venue_field_unverified", "WARN",
+             "the profile holds no verified %s; cite the page that states it and run venue-check again"
+             % ("page_limit_camera_ready" if a.camera_ready else "page_limit"))
+    if venue and a.no_sources:
+        for cid in ("VENUE-STYLE", "VENUE-OPTION"):
+            if cid in enabled:
+                skip(cid, "no_sources", "WARN", "the template is read from the LaTeX sources")
     for cid, cond, why in (("PAGE-LIMIT", page_limit is None, "not_configured"),
                            ("PAGE-FILL", fill_page is None, "not_configured"),
-                           ("ENDM-MISSING", not end_slots, "not_configured"),
-                           ("ENDM-ORDER", not end_slots, "not_configured"),
-                           ("TPL-STYLE", not a.style_ref, "not_configured"),
+                           ("ENDM-MISSING", not (end_slots or after_slots or any_slots), "not_configured"),
+                           ("ENDM-ORDER", not (end_slots or after_slots), "not_configured"),
+                           ("TPL-STYLE", not style_ref, "not_configured"),
+                           ("VENUE-STYLE", not venue, "not_configured"),
+                           ("VENUE-OPTION", not venue, "not_configured"),
+                           ("VENUE-PDF-SIZE", pdf_max_mb is None, "not_configured"),
                            ("NUM-DRIFT", not a.baseline, "not_configured"),
                            ("FIX-REGRESSION", not a.baseline, "not_configured"),
                            ("CONFIG-CHANGED", not a.baseline or run_mode == "recheck", "not_configured"),
@@ -6549,6 +6629,10 @@ def run_scan(a: Any) -> Dict[str, Any]:
         with open(pdf, "rb") as fh:
             raw = fh.read()
         add_hash(pdf)
+        if pdf_max_mb is not None and ctx.on("VENUE-PDF-SIZE") and len(raw) > float(pdf_max_mb) * 1024 * 1024:
+            findings.append(make_finding(ctx, "VENUE-PDF-SIZE", BLOCK, DEFINITE, "pdf-bytes",
+                                         "%.1f MB" % (len(raw) / 1048576.0), "limit %s MB" % pdf_max_mb,
+                                         {"artifact": rel_pdf}))
         entry: Dict[str, Any] = {"path": rel_pdf, "sha256": _sha256_bytes(raw), "pages": None, "text_file": None}
         inputs["pdf"].append(entry)
         doc = parse_pdf_objects(raw)
@@ -6631,6 +6715,9 @@ def run_scan(a: Any) -> Dict[str, Any]:
                                              "sources are newer than this PDF; source-level findings are INFO",
                                              {"artifact": rel_pdf}))
             ctx.verbatim_blob = src["verbatim_blob"]
+            if venue and not src.get("_venue_done"):
+                src["_venue_done"] = True
+                findings += venue_source_findings(src, venue, ctx, bool(a.camera_ready))
             tex_res, aux_info = scan_sources(src["expanded"], ctx, paper_dir, pol, page1)
             src_counts = aux_info["src_counts"]
             tex_f += tex_res
@@ -6649,7 +6736,7 @@ def run_scan(a: Any) -> Dict[str, Any]:
             pdf_f += scan_mathglyph(pages, ctx, rel_pdf, src_counts)
             if src is not None and ctx.on("XREF-PDF-KEY"):
                 pdf_f += _pdf_key_findings(pages, src, ctx, rel_pdf)
-            pdf_f += check_end_matter(pages, end_slots, ctx, rel_pdf) if end_slots else []
+            pdf_f += check_end_matter(pages, end_slots, ctx, rel_pdf, after_slots, any_slots)
             if ctx.on("TEXT-NOSPACE"):
                 glue = copy_glue(pdf, pages, ext["text_backend"])
                 if glue:
@@ -6665,7 +6752,8 @@ def run_scan(a: Any) -> Dict[str, Any]:
             geo = page_geometry(pages, events, pol.get("body_end_markers"))
             geo["artifact"] = rel_pdf
             page_geo.append(geo)
-            pdf_f += _page_findings(geo, page_limit, fill_page, fill_thr, ctx, rel_pdf, skipped)
+            pdf_f += _page_findings(geo, page_limit, fill_page, fill_thr, ctx, rel_pdf, skipped, page_scope,
+                                    len(pages))
             numbers_out[rel_pdf] = dict(number_multiset(pages))
             numbers_all_out[rel_pdf] = dict(number_multiset_all(pages))
             num_texts[rel_pdf] = number_text(pages, ctx)
@@ -6676,7 +6764,7 @@ def run_scan(a: Any) -> Dict[str, Any]:
                 if fill_page is not None:
                     lay["fill_ok"] = geo["body_end_page"] == int(fill_page) and geo["fill"] >= fill_thr
                 if page_limit is not None:
-                    lay["limit_ok"] = geo["body_end_page"] <= int(page_limit)
+                    lay["limit_ok"] = (len(pages) if page_scope == "total" else geo["body_end_page"]) <= int(page_limit)
             pdf_text_all.append(" ".join(s["text"] for p in pages for s in p["segs"] if s["kind"] == "body"))
             pdf_pages_text.extend((rel_pdf, p["page"], " ".join(s["text"] for s in p["segs"] if s["kind"] == "body"))
                                   for p in pages)
@@ -6708,8 +6796,8 @@ def run_scan(a: Any) -> Dict[str, Any]:
                                   pdf_pages=entry.get("pages"), notes=notes)
         blg_path = a.blg or _find_sidecar(stem, [os.path.dirname(pdf), paper_dir], ".blg")
         findings += _blg_findings(blg_path, pdf_mtime, run_mode, ctx, paper_dir, inputs, src, add_hash)
-    if a.style_ref and ctx.on("TPL-STYLE"):
-        findings += _style_findings(a.style_ref, paper_dir, ctx)
+    if style_ref and ctx.on("TPL-STYLE"):
+        findings += _style_findings(style_ref, paper_dir, ctx)
     # sources without any PDF (audit verdict is pdf_missing, but report them)
     if not disc["pdfs"]:
         for main_tex in disc["mains"]:
@@ -6899,6 +6987,8 @@ def run_scan(a: Any) -> Dict[str, Any]:
         "declared_ai_uses_set": bool(pol.get("declared_ai_uses")),
         "inputs": inputs, "input_hashes": hashes,
         "config_hashes": {k: cfg["sha256"][k] for k in ("anon_names", "allow", "policy")},
+        "venue": _venue_record(venue, paper_dir, page_limit, page_from, page_scope, end_slots, after_slots, any_slots,
+                               supp_max_mb, pdf_max_mb, style_ref, ctx.anonymous),
         "backends": backends,
         "checks_run": sorted(enabled),
         "checks_skipped": skipped,
@@ -7115,8 +7205,16 @@ def _pdf_key_findings(pages: List[Dict[str, Any]], src: Dict[str, Any], ctx: Sca
 
 
 def _page_findings(geo: Dict[str, Any], page_limit: Optional[int], fill_page: Optional[int], thr: float,
-                   ctx: ScanContext, artifact: str, skipped: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                   ctx: ScanContext, artifact: str, skipped: List[Dict[str, Any]], scope: str = "body",
+                   n_pages: Optional[int] = None) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    if scope == "total" and page_limit is not None and ctx.on("PAGE-LIMIT"):
+        # the venue counts every page, references included: no geometry needed
+        if n_pages and n_pages > int(page_limit):
+            out.append(make_finding(ctx, "PAGE-LIMIT", BLOCK, DEFINITE, "pdf-geometry", "%d pages" % n_pages,
+                                    "limit %d pages, references included" % int(page_limit),
+                                    {"artifact": artifact, "page": n_pages}))
+        page_limit = None
     wants = [c for c, v in (("PAGE-LIMIT", page_limit), ("PAGE-FILL", fill_page)) if v is not None and ctx.on(c)]
     if not wants:
         return out
@@ -7531,7 +7629,9 @@ def build_review_input(scan: Dict[str, Any], pol: Dict[str, Any],
                 "earlier_rationale": str(c.get("rationale") or "")[:300], "from": c.get("run")}
                for c in scan.get("carried_findings") or []]
     out = {"tool": TOOL, "tool_version": TOOL_VERSION, "lenses": scan["lenses"], "anonymous": scan["anonymous"],
-           "venue": pol.get("venue"), "declared_ai_uses": pol.get("declared_ai_uses"),
+           "venue": pol.get("venue") or (scan.get("venue") or {}).get("label"),
+           "venue_requirements": (scan.get("venue") or {}).get("requirements") or [],
+           "declared_ai_uses": pol.get("declared_ai_uses"),
            "venue_policy": scan.get("policy") or {},
            "pdf_text_files": [p["text_file"] for p in scan["inputs"]["pdf"] if p.get("text_file")],
            "supp_doc_files": [d["file"] for d in scan["inputs"].get("supp_docs") or []],
@@ -9573,6 +9673,7 @@ _PLAN_CATEGORY = (
     ("ANON-CODENAME", "internal code name"), ("ANON-", "anonymity"), ("META-FIGURE", "figure metadata"),
     ("META-", "PDF metadata"), ("TEXT-NOSPACE", "text layer spacing"), ("TEXT-", "text layer"),
     ("PAGE-", "pages"), ("TPL-", "template"), ("ENDM-", "end-matter statements"),
+    ("VENUE-", "venue template and limits"),
     ("SUPP-NAME", "supplement file name"), ("SUPP-PROCFILE", "process file"), ("SUPP-PATH", "supplement path"),
     ("SUPP-HW", "supplement hardware note"), ("SUPP-RUNTIME", "run time written by code"),
     ("SUPP-LANG", "supplement language"), ("SUPP-", "supplement"), ("LENS-STATEMENTS", "statements"),
@@ -15466,6 +15567,838 @@ def _error_doc(kind: str, msg: str, final: bool) -> Dict[str, Any]:
             "error": msg}
 
 
+# ─── Venue profiles (— venue:) ───────────────────────────────────────────────
+#
+# The venue options are /paper-writing's VENUE values. This table holds only what
+# stays the same from one edition to the next: the names a venue goes by, the
+# official hosts its call for papers, author guide, and template live on, how its
+# style is loaded, and its submission and final switches. Every number (page
+# limit, file sizes) and every required section comes from the venue's own pages
+# for the edition: fetched into a cache (venue-ingest) and kept only where a quote
+# found verbatim in a cached official page carries it (venue-check).
+
+VENUE_FAMILIES = ("ICLR", "NeurIPS", "ICML", "CVPR", "ACL", "AAAI", "ACM", "IEEE_JOURNAL", "IEEE_CONF")
+VENUE_DEFAULT = "ICLR"  # /paper-writing's default VENUE
+VENUE_CACHE_ENV = "ARIS_VENUE_CACHE"
+VENUE_MAX_AGE_DAYS = 30
+VENUE_PROFILE_NAME = "requirements.json"
+VENUE_DRAFT_NAME = "requirements.draft.json"
+VENUE_SECTION_POSITIONS = ("before_references", "after_references", "anywhere")
+VENUE_REVIEW_MODELS = ("double_blind", "single_blind", "not_anonymous")
+VENUE_FIELDS = ("page_limit", "page_limit_camera_ready", "page_limit_scope", "review_model", "required_sections",
+                "supp_max_mb", "pdf_max_mb")
+_MAX_VENUE_FILE = 50 * 1024 * 1024
+_MAX_VENUE_MEMBER = 20 * 1024 * 1024
+_MAX_VENUE_TOTAL = 100 * 1024 * 1024
+_MAX_VENUE_QUOTE = 600
+
+
+def _gh(org: str) -> Tuple[str, ...]:
+    """A GitHub organization as host and path prefixes (never all of GitHub)."""
+    return ("github.com/%s/" % org, "codeload.github.com/%s/" % org, "raw.githubusercontent.com/%s/" % org)
+
+
+# family -> official hosts (a host also admits its subdomains; an entry with a "/" is a host and a path
+# prefix), conferences (canonical name -> extra hosts), aliases (lower case -> conference), style or class
+# names (full match; group 1 is the year when the name carries one), whether its submissions are anonymous
+# when its pages say nothing, what its page limit counts when its pages say nothing (body: the main text;
+# total: every page, references included), the option an anonymous submission loads (review), the switch a
+# camera-ready copy needs (final: ("option", name) or ("command", name)), and pages to try first ({year},
+# {yy}) — starting points for the search, never a source by themselves.
+_VENUE_TABLE: Dict[str, Dict[str, Any]] = {
+    "ICLR": {"hosts": ("iclr.cc",) + _gh("ICLR"), "conferences": {"ICLR": ()}, "aliases": {"iclr": "ICLR"},
+             "styles": (r"iclr(\d{4})_conference",), "anonymous": True, "scope": "body",
+             "review": None, "final": ("command", "iclrfinalcopy"),
+             "hints": ("https://iclr.cc/Conferences/{year}/AuthorGuidelines",
+                       "https://iclr.cc/Conferences/{year}/CallForPapers")},
+    "NeurIPS": {"hosts": ("neurips.cc",), "conferences": {"NeurIPS": ()}, "aliases": {"neurips": "NeurIPS",
+                                                                                      "nips": "NeurIPS"},
+                "styles": (r"neurips_(\d{4})", r"nips_(\d{4})"), "anonymous": True, "scope": "body",
+                "review": None, "final": ("option", "final"),
+                "hints": ("https://neurips.cc/Conferences/{year}/CallForPapers",
+                          "https://neurips.cc/Conferences/{year}/MainTrackHandbook")},
+    "ICML": {"hosts": ("icml.cc",), "conferences": {"ICML": ()}, "aliases": {"icml": "ICML"},
+             "styles": (r"icml(\d{4})",), "anonymous": True, "scope": "body",
+             "review": None, "final": ("option", "accepted"),
+             "hints": ("https://icml.cc/Conferences/{year}/CallForPapers",
+                       "https://icml.cc/Conferences/{year}/AuthorInstructions")},
+    "CVPR": {"hosts": ("thecvf.com",) + _gh("cvpr-org"), "conferences": {"CVPR": (), "ICCV": (), "ECCV": ("ecva.net",)},
+             "aliases": {"cvpr": "CVPR", "iccv": "ICCV", "eccv": "ECCV"},
+             "styles": (r"(?:cvpr|iccv|eccv)",), "anonymous": True, "scope": "body",
+             "review": ("option", "review"), "final": None,
+             "hints": ("https://cvpr.thecvf.com/Conferences/{year}/AuthorGuidelines",
+                       "https://cvpr.thecvf.com/Conferences/{year}/CallForPapers")},
+    "ACL": {"hosts": ("aclweb.org", "aclrollingreview.org", "acl-org.github.io") + _gh("acl-org"),
+            "conferences": {"ACL": (), "EMNLP": ("emnlp.org",), "NAACL": ("naacl.org",), "EACL": ("eacl.org",),
+                            "AACL": ()},
+            "aliases": {"acl": "ACL", "arr": "ACL", "emnlp": "EMNLP", "naacl": "NAACL", "eacl": "EACL", "aacl": "AACL"},
+            "styles": (r"acl(\d{4})?",), "anonymous": True, "scope": "body",
+            "review": ("option", "review"), "final": None,
+            "hints": ("https://aclrollingreview.org/cfp", "https://acl-org.github.io/ACLPUB/formatting.html",
+                      "https://github.com/acl-org/acl-style-files")},
+    "AAAI": {"hosts": ("aaai.org",), "conferences": {"AAAI": ()}, "aliases": {"aaai": "AAAI"},
+             "styles": (r"aaai(\d{2}|\d{4})",), "anonymous": True, "scope": "body",
+             "review": ("option", "submission"), "final": None,
+             "hints": ("https://aaai.org/conference/aaai/aaai-{yy}/",)},
+    "ACM": {"hosts": ("acm.org", "ctan.org"),
+            "conferences": {"ACM": (), "ACM MM": (), "KDD": ("kdd.org",), "SIGIR": (), "CHI": (), "CIKM": (),
+                            "WSDM": (), "WWW": ()},
+            "aliases": {"acm": "ACM", "acm mm": "ACM MM", "acmmm": "ACM MM", "kdd": "KDD", "sigir": "SIGIR",
+                        "chi": "CHI", "cikm": "CIKM", "wsdm": "WSDM", "thewebconf": "WWW"},
+            "styles": (r"acmart",), "anonymous": True, "scope": "body",
+            "review": ("option", "anonymous"), "final": None,
+            "hints": ("https://www.acm.org/publications/proceedings-template", "https://ctan.org/pkg/acmart")},
+    "IEEE_JOURNAL": {"hosts": ("ieee.org", "ctan.org"), "conferences": {"IEEE_JOURNAL": ()},
+                     "aliases": {"ieee journal": "IEEE_JOURNAL", "ieee transactions": "IEEE_JOURNAL",
+                                 "ieee letters": "IEEE_JOURNAL", "tpami": "TPAMI", "tip": "TIP", "tsp": "TSP",
+                                 "twc": "TWC", "tcom": "TCOM", "jsac": "JSAC"},
+                     "styles": (r"IEEEtran",), "anonymous": False, "scope": "total", "review": None, "final": None,
+                     "hints": ("https://template-selector.ieee.org/", "https://journals.ieeeauthorcenter.ieee.org/")},
+    "IEEE_CONF": {"hosts": ("ieee.org", "ctan.org", "ieeeicassp.org", "ieee-icc.org", "ieeeglobecom.org",
+                            "ieee-infocom.org"),
+                  "conferences": {"IEEE_CONF": ()},
+                  "aliases": {"ieee conf": "IEEE_CONF", "ieee conference": "IEEE_CONF", "icc": "ICC",
+                              "globecom": "GLOBECOM", "infocom": "INFOCOM", "icassp": "ICASSP"},
+                  "styles": (r"IEEEtran",), "anonymous": False, "scope": "total", "review": None, "final": None,
+                  "hints": ("https://template-selector.ieee.org/",)},
+}
+_VENUE_STYLE_RE = re.compile(r"\\(documentclass|usepackage|RequirePackage)\s*(?:\[([^\]]*)\])?\s*\{([^{}]+)\}")
+_NUM_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+              "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+              "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50}
+_REQUIRED_WORD_RE = re.compile(r"\b(?:mandatory|required|requires?|must|need to|needs to|shall|obligatory)\b"
+                               r"|\bdesk[- ]reject")
+# a quote that also makes something optional cannot carry a requirement ("you are not required to include ...")
+_OPTIONAL_WORD_RE = re.compile(r"\b(?:not|never|no longer)\s+(?:\w+\s+){0,2}(?:required|mandatory|obligatory|need(?:ed)?)\b"
+                               r"|\bneed not\b|\b(?:do|does)(?: not|n't) (?:have|need) to\b|\boptional(?:ly)?\b"
+                               r"|\bencouraged\b|\bmay (?:also )?(?:include|add)\b")
+_POSITION_RES = {
+    "after_references": re.compile(r"\b(?:after|follow(?:s|ed|ing)?)\b[^.]{0,40}\b(?:references|bibliography)\b"
+                                   r"|\b(?:references|bibliography)\b[^.]{0,80}\b(?:then|followed by)\b"
+                                   r"|\bend of the (?:paper|pdf|document|submission)\b"),
+    "before_references": re.compile(r"\b(?:before|preced(?:e|es|ing))\b[^.]{0,40}\b(?:references|bibliography)\b"),
+}
+_SCOPE_RES = {
+    "total": re.compile(r"\binclud\w*\b[^.]{0,40}\breferences\b|\breferences\b[^.]{0,40}\b(?:are |is )?"
+                        r"(?:included|count(?:ed|s)? (?:toward|towards|against|in))"),
+    "body": re.compile(r"\breferences\b[^.]{0,120}\b(?:do(?:es)? not|don't|doesn't|not|never)\s+count"
+                       r"|\b(?:excluding|not including|exclusive of|except(?: for)?)\b[^.]{0,60}\breferences\b"
+                       r"|\breferences\b[^.]{0,60}\b(?:are |is )?(?:excluded|not counted|unlimited)\b"),
+}
+_REVIEW_MODEL_RES = {
+    "double_blind": re.compile(r"double[- ]blind|\banonymi[sz]"),
+    "single_blind": re.compile(r"single[- ]blind"),
+    "not_anonymous": re.compile(r"\bnot (?:be )?anonymi[sz]ed\b|\bnon-anonymous\b|\bnot anonymous\b"
+                                r"|\b(?:include|list|show)\b[^.]{0,40}\bauthor (?:names|information)\b"),
+}
+
+
+def _venue_norm_name(text: str) -> str:
+    return re.sub(r"[\s_\-]+", " ", (text or "").casefold()).strip()
+
+
+def _venue_dir_name(conference: str, year: int) -> str:
+    return "%s-%d" % (re.sub(r"[^A-Za-z0-9_.]+", "_", conference).strip("_") or "venue", year)
+
+
+def venue_cache_root(arg: Optional[str] = None) -> str:
+    root = arg or os.environ.get(VENUE_CACHE_ENV) or os.path.join(os.path.expanduser("~"), ".aris", "venue-cache")
+    return os.path.abspath(root)
+
+
+def parse_venue_arg(text: str) -> Dict[str, Any]:
+    """'NeurIPS 2026', 'neurips2026', 'EMNLP', 'IEEE_CONF ICASSP 2027' -> family,
+    conference, year (None when the argument names none). The options are
+    /paper-writing's VENUE values and the venues it lists under them."""
+    raw = _collapse_ws(text or "")
+    m = re.search(r"(?<!\d)(20\d{2})(?!\d)", raw)
+    year = int(m.group(1)) if m else None
+    name = _venue_norm_name((raw[:m.start()] + " " + raw[m.end():]) if m else raw)
+    if not name:
+        raise UsageError("— venue: names no venue (options: %s)" % ", ".join(VENUE_FAMILIES))
+    for fam in VENUE_FAMILIES:
+        if name == _venue_norm_name(fam):
+            return {"family": fam, "conference": next(iter(_VENUE_TABLE[fam]["conferences"])), "year": year}
+    hits: List[Tuple[int, str, str, bool]] = []
+    for fam in VENUE_FAMILIES:
+        if re.search(r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(_venue_norm_name(fam)), name):
+            hits.append((len(fam), fam, next(iter(_VENUE_TABLE[fam]["conferences"])), True))
+        for alias, conf in _VENUE_TABLE[fam]["aliases"].items():
+            if re.search(r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(alias), name):
+                hits.append((len(alias), fam, conf, conf == fam))
+    fams = sorted({h[1] for h in hits})
+    if len(fams) != 1:
+        raise UsageError("— venue: %r is %s (options: %s, and the venues /paper-writing lists under them)" % (
+            text, "ambiguous between " + ", ".join(fams) if fams else "not a known venue", ", ".join(VENUE_FAMILIES)))
+    specific = [h for h in hits if not h[3]]  # a named conference beats the family name
+    best = max(specific or hits, key=lambda h: h[0])
+    return {"family": best[1], "conference": best[2], "year": year}
+
+
+def venue_hosts(family: str, conference: str, extra: Sequence[str] = ()) -> List[str]:
+    spec = _VENUE_TABLE[family]
+    hosts = list(spec["hosts"]) + list(spec["conferences"].get(conference, ())) + [str(h) for h in extra or ()]
+    return list(dict.fromkeys(h.strip().lower() for h in hosts if str(h).strip()))
+
+
+def venue_url_ok(url: str, hosts: Sequence[str]) -> bool:
+    """An https URL on one of the venue's official hosts (or under an official
+    path prefix such as github.com/<org>/)."""
+    try:
+        u = urllib.parse.urlsplit(url or "")
+    except ValueError:
+        return False
+    if u.scheme != "https" or not u.hostname or u.username or u.password:
+        return False
+    host, path = u.hostname.lower(), (u.path or "/").lower()
+    for h in hosts:
+        h = h.lower()
+        if "/" in h:
+            hh, pp = h.split("/", 1)
+            if host == hh and path.startswith("/" + pp):
+                return True
+        elif host == h or host.endswith("." + h):
+            return True
+    return False
+
+
+def venue_of_style(name: str, options: Sequence[str] = ()) -> Tuple[Optional[str], Optional[int]]:
+    """The venue family a style or class name belongs to, and the year it names."""
+    for fam in VENUE_FAMILIES:
+        for pat in _VENUE_TABLE[fam]["styles"]:
+            m = re.fullmatch(pat, name.strip(), re.I)
+            if not m:
+                continue
+            if fam.startswith("IEEE_"):
+                fam = "IEEE_CONF" if any(o.strip().lower() == "conference" for o in options) else "IEEE_JOURNAL"
+            year = None
+            if m.groups() and m.group(1):
+                y = int(m.group(1))
+                year = y + 2000 if y < 100 else y
+            return fam, year
+    return None, None
+
+
+def detect_venue_styles(expanded: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every venue template the sources load: \\documentclass, \\usepackage, or
+    \\RequirePackage of a known style, with its options and where it stands."""
+    lines = [ln for ln in expanded["lines"] if not ln["verbatim"]]
+    text = "\n".join(ln["text"] for ln in lines)
+    out: List[Dict[str, Any]] = []
+    for m in _VENUE_STYLE_RE.finditer(text):
+        opts = [o.strip() for o in (m.group(2) or "").split(",") if o.strip()]
+        for name in _split_keys(m.group(3)):
+            fam, year = venue_of_style(name, opts)
+            if not fam:
+                continue
+            ln = lines[min(text.count("\n", 0, m.start()), len(lines) - 1)] if lines else {}
+            out.append({"family": fam, "name": name.strip(), "year": year, "options": opts, "command": m.group(1),
+                        "file": ln.get("file"), "line": ln.get("line")})
+    return out
+
+
+def _venue_profile_age_days(profile: Dict[str, Any]) -> Optional[float]:
+    when = str(profile.get("retrieved_at") or "")
+    try:
+        t = datetime.strptime(when[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - t).total_seconds() / 86400.0)
+
+
+def _venue_hints(family: str, year: Optional[int]) -> List[str]:
+    if not year:
+        return []
+    return [h.format(year=year, yy="%02d" % (year % 100)) for h in _VENUE_TABLE[family]["hints"]]
+
+
+def run_venue_resolve(a: Any) -> Tuple[Dict[str, Any], int]:
+    """Which venue and edition the audit holds the paper to, the template its
+    sources load, and whether a fresh profile of that edition is cached.
+    Exit 0: a fresh profile is cached; 1: one must be built (or refreshed)."""
+    loaded: List[Dict[str, Any]] = []
+    paper_dir = os.path.abspath(a.paper_dir) if a.paper_dir else None
+    if paper_dir and os.path.isdir(paper_dir):
+        disc = discover_inputs(paper_dir, [], a.main_tex or [], False)
+        for main in disc["mains"]:
+            for s in detect_venue_styles(expand_tex(main, paper_dir)):
+                loaded.append(dict(s, main=_rel(main, paper_dir)))
+    cfg = load_config(a.config_dir, None, None, None)
+    extra = cfg["policy"].get("venue_hosts") or []
+    if a.venue:
+        req = parse_venue_arg(a.venue)
+        family_from = "argument"
+    else:
+        # the template the sources load, else /paper-writing's default venue
+        fam = loaded[0]["family"] if loaded else VENUE_DEFAULT
+        req = {"family": fam, "conference": next(iter(_VENUE_TABLE[fam]["conferences"])), "year": None}
+        family_from = "sources" if loaded else "default"
+    fam, conf, year = req["family"], req["conference"], req["year"]
+    root = venue_cache_root(a.cache_root)
+    year_from = "argument" if year else None
+    max_age = float(a.max_age_days if a.max_age_days is not None else VENUE_MAX_AGE_DAYS)
+    cached_years = []
+    prefix = _venue_dir_name(conf, 2000)[:-4]
+    if os.path.isdir(root):
+        for d in os.listdir(root):
+            if d.startswith(prefix) and d[len(prefix):].isdigit() and \
+                    os.path.isfile(os.path.join(root, d, VENUE_PROFILE_NAME)):
+                cached_years.append(int(d[len(prefix):]))
+    cached_years.sort()
+    if not year and cached_years and not a.refresh:
+        # the newest cached edition stands for the latest only while its profile is fresh
+        prof = _load_json(os.path.join(root, _venue_dir_name(conf, cached_years[-1]), VENUE_PROFILE_NAME)) or {}
+        age = _venue_profile_age_days(prof)
+        if age is not None and age <= max_age:
+            year, year_from = cached_years[-1], "cache"
+    doc: Dict[str, Any] = {
+        "family": fam, "conference": conf, "year": year, "family_from": family_from, "year_from": year_from,
+        "sources_templates": loaded,
+        "sources_family_matches": (all(s["family"] == fam for s in loaded) if loaded else None),
+        "sources_years": sorted({s["year"] for s in loaded if s["family"] == fam and s["year"]}),
+        "official_hosts": venue_hosts(fam, conf, extra), "cache_root": root, "cached_years": cached_years,
+        "max_age_days": max_age, "url_hints": _venue_hints(fam, year),
+    }
+    if not year:
+        doc.update({"cache_dir": None, "cache_status": "year_unknown", "profile": None,
+                    "next": "find the latest edition whose call for papers or author guide is published on the "
+                            "official hosts, then run venue-resolve again with --venue '%s <year>'" % conf})
+        return doc, 1
+    cdir = os.path.join(root, _venue_dir_name(conf, year))
+    os.makedirs(cdir, exist_ok=True)
+    meta_path = os.path.join(cdir, "venue.json")
+    meta = _load_json(meta_path) or {}
+    meta.update({"schema": 1, "family": fam, "conference": conf, "year": year,
+                 "hosts": venue_hosts(fam, conf, extra), "updated_at": _now()})
+    meta.setdefault("created_at", meta["updated_at"])
+    _write_atomic(meta_path, json.dumps(meta, ensure_ascii=False, indent=1) + "\n")
+    ppath = os.path.join(cdir, VENUE_PROFILE_NAME)
+    prof = _load_json(ppath) if os.path.isfile(ppath) else None
+    age = _venue_profile_age_days(prof) if isinstance(prof, dict) else None
+    if not isinstance(prof, dict):
+        status = "missing"
+    elif a.refresh or age is None or age > max_age:
+        status = "stale"
+    else:
+        status = "fresh"
+    doc.update({"cache_dir": cdir, "cache_status": status, "profile": ppath if prof else None,
+                "profile_age_days": round(age, 1) if age is not None else None,
+                "url_hints": _venue_hints(fam, year),
+                "next": "use the cached profile" if status == "fresh" else
+                "fetch the official pages and template into the cache (venue-ingest), write %s, run venue-check"
+                % VENUE_DRAFT_NAME})
+    return doc, 0 if status == "fresh" else 1
+
+
+class _VenueText(HTMLParser):
+    """Visible text of an HTML page, one block per line (stdlib only)."""
+    _SKIP = frozenset(("script", "style", "noscript", "svg", "template", "iframe"))
+    _BLOCK = frozenset(("p", "div", "br", "li", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "td", "th",
+                        "table", "section", "article", "header", "footer", "nav", "pre", "blockquote", "dd", "dt",
+                        "dl", "main", "aside", "hr", "title"))
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.out: List[str] = []
+        self.skip = 0
+
+    def handle_starttag(self, tag: str, attrs: Any) -> None:
+        if tag in self._SKIP:
+            self.skip += 1
+        elif tag in self._BLOCK:
+            self.out.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIP:
+            self.skip = max(0, self.skip - 1)
+        elif tag in self._BLOCK:
+            self.out.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self.skip:
+            self.out.append(data)
+
+
+def html_visible_text(text: str) -> str:
+    p = _VenueText()
+    p.feed(text)
+    p.close()
+    rows = [re.sub(r"[ \t\r\f\v\u00a0]+", " ", r).strip() for r in "".join(p.out).split("\n")]
+    return "\n".join(r for r in rows if r) + "\n"
+
+
+def _venue_member_name(name: str) -> Optional[str]:
+    name = name.replace("\\", "/")
+    if name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+        return None
+    parts = [p for p in name.split("/") if p not in ("", ".")]
+    if not parts or ".." in parts or parts[0] == "__MACOSX" or parts[-1].startswith("._"):
+        return None
+    return "/".join(parts)
+
+
+def _extract_venue_archive(data: bytes, kind: str, dest: str) -> List[str]:
+    """Regular members of a template archive into dest (no absolute or parent
+    paths, no links, size caps); returns the relative names written."""
+    written: List[str] = []
+    total = 0
+
+    def put(rel: str, body: bytes) -> None:
+        nonlocal total
+        if len(body) > _MAX_VENUE_MEMBER or total + len(body) > _MAX_VENUE_TOTAL:
+            return
+        total += len(body)
+        path = os.path.join(dest, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(body)
+        written.append(rel)
+
+    if kind == "zip":
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for zi in zf.infolist():
+                rel = None if zi.is_dir() else _venue_member_name(zi.filename)
+                if rel and zi.file_size <= _MAX_VENUE_MEMBER:
+                    with zf.open(zi) as fh:
+                        put(rel, fh.read(_MAX_VENUE_MEMBER + 1))
+    else:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
+            for m in tf.getmembers():
+                rel = _venue_member_name(m.name) if m.isfile() else None
+                if rel and m.size <= _MAX_VENUE_MEMBER:
+                    fh = tf.extractfile(m)
+                    if fh is not None:
+                        put(rel, fh.read(_MAX_VENUE_MEMBER + 1))
+    return written
+
+
+def _venue_sniff(data: bytes, url: str) -> str:
+    head = data[:4096]
+    if head.startswith(b"PK\x03\x04"):
+        return "zip"
+    if head.startswith(b"%PDF"):
+        return "pdf"
+    if head.startswith(b"\x1f\x8b") or head.startswith(b"\xfd7zXZ") or head[257:262] == b"ustar":
+        return "tar"
+    low = head.decode("utf-8", "replace").casefold()
+    if "<html" in low or "<!doctype html" in low or "<body" in low:
+        return "html"
+    return "text"
+
+
+def run_venue_ingest(a: Any) -> Tuple[Dict[str, Any], int]:
+    """Record one file fetched from an official page into the venue cache: the
+    raw bytes, their URL and hash, the page's visible text (pages/<id>.txt) for
+    venue-check to verify quotes against, and a template archive unpacked under
+    template/<id>/. A URL off the venue's official hosts is refused (exit 1)."""
+    cache = os.path.abspath(a.cache)
+    meta = _load_json(os.path.join(cache, "venue.json"))
+    if not isinstance(meta, dict) or not meta.get("hosts"):
+        raise UsageError("no venue.json in %s: run venue-resolve first" % cache)
+    if not venue_url_ok(a.url, meta["hosts"]):
+        return {"accepted": False, "url": a.url, "reason": "not an https URL on an official host of %s %s" % (
+            meta.get("conference"), meta.get("year")), "official_hosts": meta["hosts"]}, 1
+    if not os.path.isfile(a.file):
+        raise UsageError("file not found: %s" % a.file)
+    if os.path.getsize(a.file) > _MAX_VENUE_FILE:
+        return {"accepted": False, "url": a.url, "reason": "larger than %d MB" % (_MAX_VENUE_FILE // 2 ** 20)}, 1
+    with open(a.file, "rb") as fh:
+        data = fh.read()
+    digest = _sha256_bytes(data)
+    sid = digest[:12]
+    kind = _venue_sniff(data, a.url)
+    ext = {"zip": ".zip", "pdf": ".pdf", "tar": ".tar", "html": ".html"}.get(kind, ".txt")
+    for sub in ("raw", "pages"):
+        os.makedirs(os.path.join(cache, sub), exist_ok=True)
+    raw_rel = "raw/%s%s" % (sid, ext)
+    with open(os.path.join(cache, raw_rel), "wb") as fh:
+        fh.write(data)
+    entry: Dict[str, Any] = {"id": sid, "url": a.url, "kind": kind, "sha256": digest, "bytes": len(data),
+                             "raw": raw_rel, "retrieved_at": _now(), "texts": []}
+
+    def add_text(tid: str, text: str, label: str) -> None:
+        rel = "pages/%s.txt" % re.sub(r"[^A-Za-z0-9_.-]+", "_", tid)
+        _write_atomic(os.path.join(cache, rel), text)
+        entry["texts"].append({"id": tid, "file": rel, "label": label, "chars": len(text)})
+
+    if kind == "html":
+        add_text(sid, html_visible_text(data.decode("utf-8", "replace")), a.url)
+    elif kind == "text":
+        add_text(sid, data.decode("utf-8", "replace"), a.url)
+    elif kind == "pdf":
+        ext_ = extract_pdf(os.path.join(cache, raw_rel), "auto")
+        pages_ = normalize_pages(ext_["pages"], frozenset()) if ext_.get("pages") else []
+        if pages_:
+            add_text(sid, "\n".join(" ".join(sg["text"] for sg in pg["segs"]) for pg in pages_) + "\n", a.url)
+        else:
+            entry["note"] = "no PDF text backend, or the PDF has no text: cite its HTML page instead"
+    else:
+        dest_rel = "template/%s" % sid
+        try:
+            names = _extract_venue_archive(data, kind, os.path.join(cache, dest_rel))
+        except (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError, lzma.LZMAError) as e:
+            return {"accepted": False, "url": a.url, "reason": "unreadable archive: %s" % e}, 1
+        entry["template_dir"] = dest_rel
+        entry["template_files"] = names
+        for rel in names:
+            if rel.lower().endswith((".tex", ".txt", ".md")):
+                with open(os.path.join(cache, dest_rel, *rel.split("/")), "rb") as fh:
+                    add_text("template:%s/%s" % (sid, rel), fh.read().decode("utf-8", "replace"), rel)
+    spath = os.path.join(cache, "sources.json")
+    sources = [s for s in (_load_json(spath) or []) if isinstance(s, dict) and s.get("url") != a.url]
+    sources.append(entry)
+    _write_atomic(spath, json.dumps(sources, ensure_ascii=False, indent=1) + "\n")
+    return dict(entry, accepted=True), 0
+
+
+def _vq_norm(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s or "")
+    for a_, b_ in (("\u2018", "'"), ("\u2019", "'"), ("\u201c", '"'), ("\u201d", '"'), ("\u2013", "-"),
+                   ("\u2014", "-"), ("\u00a0", " ")):
+        s = s.replace(a_, b_)
+    return re.sub(r"\s+", " ", s).strip().casefold()
+
+
+def _quote_numbers(q: str, unit_mb: bool) -> Set[float]:
+    out: Set[float] = set()
+    for m in re.finditer(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(gb|mb|kb|gigabytes?|megabytes?)?\b", q):
+        val, unit = float(m.group(1)), (m.group(2) or "")
+        if unit_mb:
+            if not unit:
+                continue
+            val = val * 1024 if unit.startswith("g") else val / 1024 if unit.startswith("k") else val
+        out.add(val)
+    if not unit_mb:
+        for w, n in _NUM_WORDS.items():
+            if re.search(r"\b%s\b" % w, q):
+                out.add(float(n))
+    return out
+
+
+def _check_venue_field(name: str, item: Dict[str, Any], texts: Dict[str, str], verified: Dict[str, Any]
+                       ) -> Tuple[Optional[Any], str]:
+    """(value, '') when the quote is verbatim in the cited page and carries the
+    value; else (None, why)."""
+    value, src, quote = item.get("value"), str(item.get("source") or ""), str(item.get("quote") or "")
+    q = _vq_norm(quote)
+    if not src or src not in texts:
+        return None, "source %r is not a page in this cache" % src
+    if len(q) < 12 or len(quote) > _MAX_VENUE_QUOTE:
+        return None, "quote missing, shorter than 12 or longer than %d characters" % _MAX_VENUE_QUOTE
+    if q not in texts[src]:
+        return None, "quote not found verbatim in %s" % src
+    if name in ("page_limit", "page_limit_camera_ready"):
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 60 or "page" not in q:
+            return None, "not a page count, or the quote does not speak of pages"
+        if float(value) in _quote_numbers(q, False):
+            return value, ""
+        base = verified.get("page_limit")
+        m = re.search(r"\b(an?|one|two|three|\d+)\s+(?:additional|extra|more)\b[^.]{0,30}\bpages?\b", q)
+        if name == "page_limit_camera_ready" and base and m:
+            n = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3}.get(m.group(1)) or int(m.group(1))
+            if value == base + n:
+                return value, ""
+        return None, "the quote does not state %s" % value
+    if name == "page_limit_scope":
+        if value not in _SCOPE_RES:
+            return None, "scope must be body or total"
+        return (value, "") if _SCOPE_RES[value].search(q) else (None, "the quote does not say how references count")
+    if name == "review_model":
+        if value not in VENUE_REVIEW_MODELS:
+            return None, "review model must be one of %s" % ", ".join(VENUE_REVIEW_MODELS)
+        return (value, "") if _REVIEW_MODEL_RES[value].search(q) else (None, "the quote does not state it")
+    if name in ("supp_max_mb", "pdf_max_mb"):
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+            return None, "not a size in MB"
+        hit = any(abs(x - float(value)) < 1e-6 for x in _quote_numbers(q, True))
+        return (float(value), "") if hit else (None, "the quote does not state %s MB" % value)
+    return None, "unknown field"
+
+
+def _check_venue_section(item: Dict[str, Any], texts: Dict[str, str], conference: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    heading = _collapse_ws(str(item.get("heading") or ""))
+    alts = [_collapse_ws(str(x)) for x in item.get("alternatives") or [] if _collapse_ws(str(x))]
+    src, quote = str(item.get("source") or ""), str(item.get("quote") or "")
+    q = _vq_norm(quote)
+    if not heading:
+        return None, "no heading"
+    if not src or src not in texts:
+        return None, "source %r is not a page in this cache" % src
+    if len(q) < 12 or len(quote) > _MAX_VENUE_QUOTE or q not in texts[src]:
+        return None, "quote not found verbatim in %s" % src
+    names = [_vq_norm(x) for x in [heading] + alts]
+    names += [_vq_norm(re.sub(re.escape(conference), "", x, flags=re.I)) for x in [heading] + alts]
+    if not any(n and n in q for n in names):
+        return None, "the quote does not name the section"
+    if not _REQUIRED_WORD_RE.search(q) or _OPTIONAL_WORD_RE.search(q):
+        return None, "the quote does not make the section required (or also makes something optional)"
+    pos = str(item.get("position") or "anywhere")
+    if pos not in VENUE_SECTION_POSITIONS:
+        return None, "position must be one of %s" % ", ".join(VENUE_SECTION_POSITIONS)
+    note = ""
+    if pos != "anywhere":
+        psrc, pquote = str(item.get("position_source") or src), str(item.get("position_quote") or quote)
+        pq = _vq_norm(pquote)
+        ok = psrc in texts and len(pq) >= 12 and pq in texts[psrc] and bool(_POSITION_RES[pos].search(pq))
+        if not ok:
+            pos, note = "anywhere", "position not verified: checked for presence only"
+    out = {"heading": heading, "alternatives": alts, "position": pos, "source": src, "quote": quote}
+    return out, note
+
+
+def run_venue_check(a: Any) -> Tuple[Dict[str, Any], int]:
+    """Turn requirements.draft.json into requirements.json: every field kept only
+    when its quote is verbatim in a cached official page and carries the value.
+    Unverified fields are dropped and listed — never filled in from memory."""
+    cache = os.path.abspath(a.cache)
+    meta = _load_json(os.path.join(cache, "venue.json"))
+    if not isinstance(meta, dict):
+        raise UsageError("no venue.json in %s: run venue-resolve first" % cache)
+    sources = [s for s in (_load_json(os.path.join(cache, "sources.json")) or []) if isinstance(s, dict)]
+    draft_path = a.draft or os.path.join(cache, VENUE_DRAFT_NAME)
+    draft = _load_json(draft_path)
+    if not isinstance(draft, dict):
+        raise UsageError("draft not found or not JSON: %s" % draft_path)
+    hosts = meta.get("hosts") or []
+    texts: Dict[str, str] = {}
+    urls: Dict[str, str] = {}
+    for s in sources:
+        if not venue_url_ok(str(s.get("url") or ""), hosts):
+            continue
+        for t_ in s.get("texts") or []:
+            p = os.path.join(cache, t_["file"])
+            if os.path.isfile(p):
+                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                    texts[t_["id"]] = _vq_norm(fh.read())
+                urls[t_["id"]] = s["url"]
+        texts.setdefault(s["url"], texts.get(s["id"], ""))  # a field may cite the page by its URL
+        urls.setdefault(s["url"], s["url"])
+    fields_in = draft.get("fields") or {}
+    if not isinstance(fields_in, dict):
+        raise UsageError("draft 'fields' must be an object")
+    verified: Dict[str, Any] = {}
+    kept: Dict[str, Any] = {}
+    dropped: List[Dict[str, Any]] = []
+    for name in VENUE_FIELDS:  # page_limit before page_limit_camera_ready
+        item = fields_in.get(name)
+        if item is None:
+            continue
+        if name == "required_sections":
+            vals = item.get("value") if isinstance(item, dict) else item
+            secs = []
+            for it in vals or []:
+                sec, why = _check_venue_section(it if isinstance(it, dict) else {}, texts,
+                                                str(meta.get("conference") or ""))
+                if sec is None:
+                    dropped.append({"field": "required_sections", "heading": (it or {}).get("heading")
+                                    if isinstance(it, dict) else None, "reason": why})
+                    continue
+                if why:
+                    dropped.append({"field": "required_sections.position", "heading": sec["heading"], "reason": why})
+                sec["url"] = urls.get(sec["source"])
+                secs.append(sec)
+            if secs:
+                kept[name] = {"value": secs}
+                verified[name] = secs
+            continue
+        if not isinstance(item, dict):
+            dropped.append({"field": name, "reason": "not an object with value, source, quote"})
+            continue
+        val, why = _check_venue_field(name, item, texts, verified)
+        if val is None:
+            dropped.append({"field": name, "reason": why})
+            continue
+        verified[name] = val
+        kept[name] = {"value": val, "source": item["source"], "url": urls.get(str(item["source"])),
+                      "quote": item["quote"]}
+    for name in fields_in:
+        if name not in VENUE_FIELDS:
+            dropped.append({"field": name, "reason": "unknown field"})
+    fam = meta["family"]
+    tpl: Dict[str, Any] = {}
+    archives = sorted((s for s in sources if s.get("template_dir") and venue_url_ok(str(s.get("url") or ""), hosts)),
+                      key=lambda s: s.get("retrieved_at") or "")
+    if archives:
+        src_ = archives[-1]
+        dirs: Counter = Counter()
+        for rel in src_.get("template_files") or []:
+            if rel.lower().endswith((".sty", ".cls", ".bst")):
+                dirs[os.path.dirname(rel)] += 1
+        if dirs:
+            d_rel = max(dirs.items(), key=lambda kv: (kv[1], -kv[0].count("/")))[0]
+            style_dir = os.path.join(src_["template_dir"], *d_rel.split("/")) if d_rel else src_["template_dir"]
+            files = sorted(f for f in os.listdir(os.path.join(cache, style_dir))
+                           if f.lower().endswith((".sty", ".cls", ".bst")))
+            styles = []
+            for f in files:
+                stem = os.path.splitext(f)[0]
+                sfam, syear = venue_of_style(stem)
+                if sfam and not any(x["name"] == stem for x in styles):
+                    styles.append({"name": stem, "family": sfam, "year": syear})
+            years = sorted({s["year"] for s in styles if s["year"]})
+            tpl = {"style_dir": style_dir.replace(os.sep, "/"), "files": files, "styles": styles,
+                   "source_url": src_["url"], "sha256": src_["sha256"],
+                   "family_ok": (all(s["family"].split("_")[0] == fam.split("_")[0] for s in styles)
+                                 if styles else None),
+                   "edition_ok": (meta["year"] in years) if years else None}
+        else:
+            dropped.append({"field": "template", "reason": "the archive holds no .sty, .cls, or .bst file"})
+    used = {kept[k]["source"] for k in kept if k != "required_sections"} | \
+        {s["source"] for s in kept.get("required_sections", {}).get("value", [])}
+    times = [s.get("retrieved_at") for s in sources if s.get("id") in used or s.get("url") in used]
+    times += [s.get("retrieved_at") for s in archives[-1:]]
+    times = sorted(t_ for t_ in times if t_)
+    year_seen = any(str(meta["year"]) in (s.get("url") or "") for s in sources) or any(
+        str(meta["year"]) in texts.get(k, "") for k in used)
+    doc = {"schema": 1, "family": fam, "conference": meta["conference"], "year": meta["year"],
+           "checked_at": _now(), "retrieved_at": times[0] if times else None,
+           "edition_note": draft.get("edition_note"), "edition_seen": year_seen,
+           "fields": kept, "defaults": {"page_limit_scope": _VENUE_TABLE[fam]["scope"],
+                                        "anonymous": _VENUE_TABLE[fam]["anonymous"]},
+           "template": tpl, "dropped": dropped,
+           "sources": [{"id": s["id"], "url": s["url"], "sha256": s["sha256"], "retrieved_at": s["retrieved_at"]}
+                       for s in sources]}
+    if not kept and not tpl:
+        return dict(doc, written=None), 1
+    out = os.path.join(cache, VENUE_PROFILE_NAME)
+    _write_atomic(out, json.dumps(doc, ensure_ascii=False, indent=1) + "\n")
+    return dict(doc, written=out), 0
+
+
+def load_venue(a: Any, pol: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The venue a scan holds the paper to: from --venue-profile (a venue-check
+    profile) and/or --venue. None when neither is given."""
+    req = parse_venue_arg(a.venue) if getattr(a, "venue", None) else None
+    ppath = getattr(a, "venue_profile", None)
+    prof = None
+    if ppath:
+        prof = _load_json(ppath)
+        if not isinstance(prof, dict) or prof.get("schema") != 1 or prof.get("family") not in VENUE_FAMILIES \
+                or not isinstance(prof.get("fields"), dict) or not prof.get("checked_at"):
+            raise UsageError("--venue-profile is not a venue-check profile: %s" % ppath)
+        if req and (req["family"] != prof["family"] or (req["year"] and req["year"] != prof.get("year"))):
+            raise UsageError("— venue: %s does not match the profile (%s %s)" % (
+                a.venue, prof.get("conference"), prof.get("year")))
+    if not req and not prof:
+        return None
+    fam = prof["family"] if prof else req["family"]
+    conf = prof.get("conference") if prof else req["conference"]
+    year = prof.get("year") if prof else req["year"]
+    fields = {k: v.get("value") for k, v in (prof or {}).get("fields", {}).items() if isinstance(v, dict)}
+    tpl = (prof or {}).get("template") or {}
+    style_dir = os.path.join(os.path.dirname(os.path.abspath(ppath)), *tpl["style_dir"].split("/")) \
+        if prof and tpl.get("style_dir") else None
+    tpl_text = ""
+    if style_dir and os.path.isdir(style_dir):
+        for f in sorted(os.listdir(style_dir)):
+            if f.lower().endswith((".sty", ".cls")):
+                tpl_text += _read_text(os.path.join(style_dir, f))[:2_000_000] + "\n"
+    else:
+        style_dir = None
+    reqs = []
+    for k, v in (prof or {}).get("fields", {}).items():
+        if k == "required_sections":
+            for s in v.get("value") or []:
+                reqs.append("required section '%s' (%s): \"%s\"" % (s["heading"], s["position"], s["quote"][:200]))
+        elif isinstance(v, dict):
+            reqs.append("%s = %s: \"%s\"" % (k, v.get("value"), str(v.get("quote") or "")[:200]))
+    return {"family": fam, "conference": conf, "year": year, "label": "%s %s" % (conf, year or "(edition unknown)"),
+            "profile": os.path.abspath(ppath) if ppath else None,
+            "profile_sha256": _sha256_file(ppath) if ppath else None, "fields": fields,
+            "spec": _VENUE_TABLE[fam], "style_dir": style_dir, "template_text": tpl_text,
+            "template_styles": [s for s in tpl.get("styles") or []], "requirements": reqs,
+            "edition_note": (prof or {}).get("edition_note"), "styles_loaded": []}
+
+
+def _venue_option_declared(tpl_text: str, kind: str, name: str) -> Optional[bool]:
+    """Whether the cached template defines the option or command (None: no template to ask)."""
+    if not tpl_text:
+        return None
+    if kind == "command":
+        return bool(re.search(r"\\(?:def|newcommand\*?|providecommand\*?)\s*\{?\\%s\b" % re.escape(name), tpl_text))
+    return bool(re.search(r"\{\s*%s\s*\}" % re.escape(name), tpl_text))
+
+
+def venue_source_findings(src: Dict[str, Any], venue: Dict[str, Any], ctx: ScanContext,
+                          camera_ready: bool) -> List[Dict[str, Any]]:
+    """VENUE-STYLE: the sources load the target venue's template, of the edition
+    the venue now provides. VENUE-OPTION: its submission and final switches
+    match the mode (anonymous submission or camera-ready copy)."""
+    out: List[Dict[str, Any]] = []
+    loaded = detect_venue_styles(src["expanded"])
+    venue["styles_loaded"].extend({k: s[k] for k in ("family", "name", "year", "options", "file", "line")}
+                                  for s in loaded)
+    fam, year, label = venue["family"], venue["year"], venue["label"]
+    own = [s for s in loaded if s["family"] == fam]
+    other = [s for s in loaded if s["family"] != fam]
+    main_loc = {"file": src["expanded"]["files"][0] if src["expanded"]["files"] else None}
+    if main_loc["file"]:
+        main_loc["file"] = os.path.basename(main_loc["file"])
+    cur = sorted({s["name"] for s in venue["template_styles"] if s.get("family") == fam})
+    if ctx.on("VENUE-STYLE"):
+        if not own:
+            if other:
+                s = other[0]
+                out.append(make_finding(ctx, "VENUE-STYLE", BLOCK, DEFINITE, "tex", s["name"],
+                                        "loads %s (%s template), not the %s template" % (s["name"], s["family"], label),
+                                        {"file": s["file"], "line": s["line"]}))
+            else:
+                out.append(make_finding(ctx, "VENUE-STYLE", BLOCK, DEFINITE, "tex", "no %s template" % fam,
+                                        "no \\documentclass or \\usepackage of the %s template in the sources" % label,
+                                        main_loc))
+        for s in own:
+            if s["year"] and year and s["year"] != year:
+                out.append(make_finding(ctx, "VENUE-STYLE", BLOCK, DEFINITE, "tex", s["name"],
+                                        "loads the %d template (%s); %s provides %s" % (
+                                            s["year"], s["name"], label, ", ".join(cur) or "a newer one"),
+                                        {"file": s["file"], "line": s["line"]}))
+    if not own or not ctx.on("VENUE-OPTION"):
+        return out
+    s, spec = own[0], venue["spec"]
+    opts = {o.lower() for o in s["options"]}
+    loc = {"file": s["file"], "line": s["line"]}
+    text_all = "\n".join(ln["text"] for ln in src["expanded"]["lines"] if not ln["verbatim"])
+
+    def flag(kind: str, name: str, what: str) -> None:
+        declared = _venue_option_declared(venue["template_text"], kind, name)
+        if declared is False:
+            return  # the edition's template has no such switch: nothing to hold the paper to
+        out.append(make_finding(ctx, "VENUE-OPTION", BLOCK if declared else WARN, DEFINITE, "tex", s["name"], what, loc,
+                                note=None if declared else "the venue's template is not cached; switch from the "
+                                                            "venue table, not checked against this edition"))
+
+    rev, fin = spec.get("review"), spec.get("final")
+    if rev and ctx.anonymous and not camera_ready and rev[1] not in opts:
+        flag("option", rev[1], "the anonymous %s submission needs %s with [%s]" % (label, s["name"], rev[1]))
+    if camera_ready:
+        if rev and rev[1] in opts:
+            flag("option", rev[1], "the camera-ready copy still loads %s with [%s]" % (s["name"], rev[1]))
+        if fin and fin[0] == "option" and fin[1] not in opts:
+            flag("option", fin[1], "the %s camera-ready copy needs %s with [%s]" % (label, s["name"], fin[1]))
+        if fin and fin[0] == "command" and not re.search(r"\\%s\b" % re.escape(fin[1]), text_all):
+            flag("command", fin[1], "the %s camera-ready copy needs \\%s" % (label, fin[1]))
+    return out
+
+
+def _venue_record(venue: Optional[Dict[str, Any]], paper_dir: str, page_limit: Any, page_from: Optional[str],
+                  page_scope: str, end_slots: List[List[str]], after_slots: List[List[str]],
+                  any_slots: List[List[str]], supp_max_mb: Any, pdf_max_mb: Any, style_ref: Optional[str],
+                  anonymous: bool) -> Optional[Dict[str, Any]]:
+    """What the scan held the paper to, and where each value came from."""
+    if not venue:
+        return None
+    return {"family": venue["family"], "conference": venue["conference"], "year": venue["year"],
+            "label": venue["label"], "edition_note": venue.get("edition_note"),
+            "profile": _display_path(venue["profile"], paper_dir) if venue["profile"] else None,
+            "profile_sha256": venue["profile_sha256"],
+            "applied": {"page_limit": page_limit, "page_limit_from": page_from, "page_limit_scope": page_scope,
+                        "end_matter": end_slots, "after_references": after_slots, "anywhere": any_slots,
+                        "supp_max_mb": supp_max_mb, "pdf_max_mb": pdf_max_mb,
+                        "style_ref": _display_path(style_ref, paper_dir) if style_ref else None,
+                        "anonymous": anonymous},
+            "templates_loaded": venue["styles_loaded"], "requirements": venue["requirements"]}
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="ARIS /paper-hygiene-audit deterministic scanner and verdict finalizer.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -15498,6 +16431,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--registration-labels", choices=REGISTRATION_POLICIES,
                    help="registration amendment/addendum labels: keep (default: INFO) or flag (candidates)")
     s.add_argument("--style-ref", help="directory with the official .sty/.cls/.bst")
+    s.add_argument("--venue", help="target venue, /paper-writing's VENUE values: ICLR, NeurIPS, ICML, CVPR, ACL, "
+                                   "AAAI, ACM, IEEE_JOURNAL, IEEE_CONF (or a venue they list, e.g. 'EMNLP 2026')")
+    s.add_argument("--venue-profile", help="requirements.json written by venue-check (page limit, required sections, "
+                                           "review model, file limits, cached official template)")
     s.add_argument("--supp-max-mb", type=float)
     s.add_argument("--baseline", help="round-0 scan.json (fix rounds, recheck after a fix run) or an earlier PDF")
     s.add_argument("--previous", help="the previous fix round's scan.json: FIX-REGRESSION names what this round broke")
@@ -15587,6 +16524,23 @@ def build_parser() -> argparse.ArgumentParser:
                          "round: a supplement problem never takes the paper's fixes back, nor the reverse)")
     lc = sub.add_parser("list-checks", help="print the check table")
     lc.add_argument("--format", choices=("json", "md"), default="json")
+    vr = sub.add_parser("venue-resolve", help="the target venue and edition, the template the sources load, and "
+                                              "whether a fresh profile is cached")
+    vr.add_argument("paper_dir", nargs="?", default=None)
+    vr.add_argument("--venue", help="e.g. 'NeurIPS', 'NeurIPS 2026', 'EMNLP 2026' (default: from the sources)")
+    vr.add_argument("--main-tex", action="append")
+    vr.add_argument("--cache-root", help="default: $%s or ~/.aris/venue-cache" % VENUE_CACHE_ENV)
+    vr.add_argument("--max-age-days", type=float, help="a profile older than this is stale (default %d)"
+                                                       % VENUE_MAX_AGE_DAYS)
+    vr.add_argument("--refresh", action="store_true", help="treat the cached profile as stale")
+    vr.add_argument("--config-dir", default=os.path.join(".aris", "paper-hygiene"))
+    vi = sub.add_parser("venue-ingest", help="record one file fetched from an official page into the venue cache")
+    vi.add_argument("--cache", required=True, help="the cache_dir venue-resolve printed")
+    vi.add_argument("--url", required=True, help="the URL the file was fetched from (after redirects)")
+    vi.add_argument("--file", required=True)
+    vc = sub.add_parser("venue-check", help="verify requirements.draft.json quote by quote; write requirements.json")
+    vc.add_argument("--cache", required=True)
+    vc.add_argument("--draft", help="default: <cache>/%s" % VENUE_DRAFT_NAME)
     r = sub.add_parser("repack", help="deterministic zip of a supplementary directory")
     r.add_argument("--src", required=True)
     r.add_argument("--out", required=True)
@@ -15614,7 +16568,9 @@ __all__ = [
     "cite_key_note", "tier_a_verdict", "final_verdict", "build_review_input", "render_md",
     "parse_review", "merge_review", "stale_other_audits", "run_scan", "run_finalize", "run_status", "run_repack",
     "run_apply", "run_edits", "run_restore", "verify_change", "verify_edit", "diff_snapshots", "build_fix_plan",
-    "render_fix_plan", "list_checks", "main",
+    "render_fix_plan", "list_checks", "parse_venue_arg", "venue_url_ok", "venue_of_style", "detect_venue_styles",
+    "html_visible_text", "run_venue_resolve", "run_venue_ingest", "run_venue_check", "load_venue",
+    "venue_source_findings", "main",
 ]
 
 
@@ -15624,9 +16580,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if a.cmd == "list-checks":
         _stdout(list_checks(a.format))
         return 0
-    if a.cmd in ("repack", "status", "edits", "apply", "restore"):
+    if a.cmd in ("repack", "status", "edits", "apply", "restore", "venue-resolve", "venue-ingest", "venue-check"):
         runner = {"repack": run_repack, "status": run_status, "edits": run_edits, "apply": run_apply,
-                  "restore": run_restore}[a.cmd]
+                  "restore": run_restore, "venue-resolve": run_venue_resolve, "venue-ingest": run_venue_ingest,
+                  "venue-check": run_venue_check}[a.cmd]
         try:
             doc, rc = runner(a)
         except UsageError as e:
